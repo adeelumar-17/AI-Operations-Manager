@@ -16,15 +16,25 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # Database
-    POSTGRES_DB: str
-    POSTGRES_USER: str
-    POSTGRES_PASSWORD: str
+    POSTGRES_DB: str = "ai_operations_manager"
+    POSTGRES_USER: str = "postgres"
+    POSTGRES_PASSWORD: str = "postgres"
     DATABASE_URL: str
+    DATABASE_URL_DIRECT: str = ""
 
-    @field_validator("DATABASE_URL", mode="after")
+    @field_validator("DATABASE_URL", "DATABASE_URL_DIRECT", mode="after")
     @classmethod
-    def resolve_database_host(cls, v: str) -> str:
-        """If host is 'db' (Docker network) but host machine cannot resolve it, fallback to 'localhost'."""
+    def resolve_database_url(cls, v: str) -> str:
+        """Normalize driver dialect to postgresql+psycopg and resolve Docker container hostnames if needed."""
+        if not v:
+            return v
+        # Ensure postgresql+psycopg dialect prefix if standard postgres:// or postgresql:// is provided
+        if v.startswith("postgres://"):
+            v = "postgresql+psycopg://" + v[len("postgres://"):]
+        elif v.startswith("postgresql://") and not v.startswith("postgresql+"):
+            v = "postgresql+psycopg://" + v[len("postgresql://"):]
+
+        # If host is 'db' (Docker network) but host machine cannot resolve it, fallback to 'localhost'
         if "@db:" in v or "@db/" in v:
             try:
                 socket.gethostbyname("db")

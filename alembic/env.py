@@ -16,11 +16,14 @@ from backend.app.db.models import Base
 
 import backend.app.db.models
 
-config = context.config
+# Alembic migrations must connect directly to the database instance (unpooled)
+# rather than through a connection pooler (such as Neon's PgBouncer) because DDL
+# statements, migration locks, and transactional session states require direct connections.
+migration_url = settings.DATABASE_URL_DIRECT or settings.DATABASE_URL
 
 config.set_main_option(
     "sqlalchemy.url",
-    settings.DATABASE_URL,
+    migration_url,
 )
 
 if config.config_file_name is not None:

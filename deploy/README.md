@@ -12,19 +12,27 @@ This guide deploys the AI Operations Manager backend as a **container-based AWS 
 
 ## Step 0 — Run Alembic Migrations Against Neon
 
-Point your local `.env` at the Neon database (use the **non-pooled** string for migrations):
-
-```ini
-DATABASE_URL=postgresql+psycopg://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require
+Ensure required extensions are enabled in your Neon database SQL editor:
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 ```
 
-Then run:
+Configure both Neon connection strings in your local `.env`:
+
+```ini
+# Pooled connection string (used by app runtime / Lambda)
+DATABASE_URL=postgresql+psycopg://user:pass@ep-xxx.pooler.eu-central-1.aws.neon.tech/neondb?sslmode=require
+
+# Direct unpooled connection string (used by Alembic migrations)
+DATABASE_URL_DIRECT=postgresql+psycopg://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require
+```
+
+Then run Alembic migrations locally (Alembic will automatically use `DATABASE_URL_DIRECT`):
 
 ```bash
 alembic upgrade head
 ```
-
-Switch back to the **pooled** string for Lambda (see Step 5).
 
 ---
 

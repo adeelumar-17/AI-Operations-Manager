@@ -132,9 +132,34 @@ GROQ_MAX_TOKENS=2048
 GROQ_REASONING_EFFORT=medium
 ```
 
-### 3. Start Database & Run Migrations
+### 3. Database Setup: Neon (Production) & Local Docker
+
+This project uses **Neon (serverless PostgreSQL)** as its database in production (and AWS Lambda deployments). It also supports local PostgreSQL via Docker Compose for offline development.
+
+#### Enabling Required Neon Extensions
+Before running migrations against your Neon database, run the following SQL statements in the **Neon Console SQL Editor** (or via `psql`) to enable the required extensions:
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+```
+
+#### Connection Strings: Pooled vs. Direct
+Neon provides two distinct connection endpoints:
+- **`DATABASE_URL` (Pooled)**: Neon's PgBouncer pooled connection (`<ep-name>-pooler...`). The FastAPI application and AWS Lambda runtime use this URL to safely handle concurrent requests without exhausting database connection limits.
+- **`DATABASE_URL_DIRECT` (Direct)**: Neon's direct unpooled compute connection (`<ep-name>...`). **Alembic migrations must be run with `DATABASE_URL_DIRECT` rather than the pooled URL**, as connection poolers in transaction mode do not support the session-level locking and transactional DDL statements required by schema migrations.
+
+The Alembic runner (`alembic/env.py`) automatically sources `DATABASE_URL_DIRECT` for migrations.
+
+#### Running Migrations
+For local Docker Compose:
 ```bash
 docker compose up db -d
+alembic upgrade head
+```
+
+For Neon:
+Set `DATABASE_URL` and `DATABASE_URL_DIRECT` in your `.env` (copied from `.env.example`), then run:
+```bash
 alembic upgrade head
 ```
 
