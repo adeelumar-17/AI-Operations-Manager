@@ -85,7 +85,7 @@ AI-Operations-Manager/
 │   ├── graph/nodes/            # Routing nodes (classify, entities) & 6 workflow nodes
 │   ├── tools/                  # 18 domain tools bound to LangGraph
 │   ├── prompts/                # System, routing, extraction, and response prompts
-│   ├── memory/                 # Checkpointer (SqliteSaver / MemorySaver)
+│   ├── memory/                 # Checkpointer (PostgresSaver / MemorySaver)
 │   ├── llm.py                  # Groq client & ChatGroq factory (openai/gpt-oss-120b)
 │   ├── agent_service.py        # Single callable run_agent() & resume_agent() interface
 │   └── tests/                  # Agent smoke tests & HITL verification
@@ -95,6 +95,9 @@ AI-Operations-Manager/
 │   ├── embeddings.py           # Sentence-transformers embedding backend (384-dim)
 │   ├── retriever.py            # Cosine similarity vector search
 │   └── vector_store.py         # VectorStore facade
+│
+├── scripts/
+│   └── setup_checkpointer.py   # One-time setup script for LangGraph PostgresSaver tables
 │
 ├── data/policies/              # Markdown policy documents (discounts, refunds, etc.)
 ├── tests/eval/                 # Evaluation dataset (eval_cases.json) and benchmark runner
@@ -162,6 +165,16 @@ Set `DATABASE_URL` and `DATABASE_URL_DIRECT` in your `.env` (copied from `.env.e
 ```bash
 alembic upgrade head
 ```
+
+#### Initializing LangGraph Checkpoint Tables
+LangGraph uses **PostgresSaver** to persist agent graph states and manage human-in-the-loop (HITL) checkpoints across process restarts and Lambda invocations. Its checkpoint tables (`checkpoints`, `checkpoint_blobs`, `checkpoint_writes`, `checkpoint_migrations`) are managed separately from Alembic business tables.
+
+Run the one-time checkpointer setup script (which connects using `DATABASE_URL_DIRECT`):
+```bash
+python scripts/setup_checkpointer.py
+```
+> **Important**: This script must be run once against Neon before the human-in-the-loop / approval flow will work, in the same way `alembic upgrade head` must be run once for the business schema.
+
 
 ### 4. Ingest Policy Documents
 ```bash

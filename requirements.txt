@@ -1,9 +1,10 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 fastapi
 uvicorn[standard]
 sqlalchemy
 alembic
 psycopg[binary]
-psycopg2-binary
 pydantic-settings
 pgvector
 
@@ -18,7 +19,8 @@ sentence-transformers
 
 # Agent graph orchestration & persistence
 langgraph
-langgraph-checkpoint-sqlite
+langgraph-checkpoint-postgres
 
 # Scheduling
 apscheduler
+

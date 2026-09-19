@@ -29,8 +29,7 @@ def main():
 
     args = parser.parse_args()
 
-    # Ensure sync driver compatibility for create_engine
-    db_url = args.db_url.replace("postgresql+psycopg://", "postgresql+psycopg2://")
+    db_url = args.db_url
 
     print(f"Ingesting policies from '{args.policies_dir}' into database...")
     print(f"Force re-ingest: {args.force}")

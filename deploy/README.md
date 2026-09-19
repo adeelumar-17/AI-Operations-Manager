@@ -28,10 +28,14 @@ DATABASE_URL=postgresql+psycopg://user:pass@ep-xxx.pooler.eu-central-1.aws.neon.
 DATABASE_URL_DIRECT=postgresql+psycopg://user:pass@ep-xxx.eu-central-1.aws.neon.tech/neondb?sslmode=require
 ```
 
-Then run Alembic migrations locally (Alembic will automatically use `DATABASE_URL_DIRECT`):
+Then run Alembic migrations and the LangGraph checkpointer initialization locally:
 
 ```bash
+# 1. Run Alembic business migrations (uses DATABASE_URL_DIRECT)
 alembic upgrade head
+
+# 2. Create LangGraph checkpoint tables (uses DATABASE_URL_DIRECT)
+python scripts/setup_checkpointer.py
 ```
 
 ---

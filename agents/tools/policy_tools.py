@@ -39,12 +39,9 @@ def search_business_policy(
       - "What is the standard payment term?"
     """
     db_url = settings.DATABASE_URL
-    # The standalone retrieve() uses create_engine() directly which works with
-    # both psycopg (async) and psycopg2 (sync). We strip the async driver prefix.
-    db_url_sync = db_url.replace("postgresql+psycopg://", "postgresql+psycopg2://")
 
     try:
-        results = retrieve(query, db_url_sync, top_k=top_k)
+        results = retrieve(query, db_url, top_k=top_k)
         if not results:
             return "No relevant policy found for that query."
 

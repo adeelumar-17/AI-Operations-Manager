@@ -21,9 +21,7 @@ def run_tests() -> bool:
     from rag.ingestion.ingest import ingest_policies
     from rag.retriever import retrieve
 
-    db_url_sync = settings.DATABASE_URL.replace(
-        "postgresql+psycopg://", "postgresql+psycopg2://"
-    )
+    db_url_sync = settings.DATABASE_URL
 
     print("=" * 60)
     print("M3 RAG Tests")
