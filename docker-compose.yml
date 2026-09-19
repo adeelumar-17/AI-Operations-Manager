@@ -1,0 +1,73 @@
+services:
+
+  db:
+    image: pgvector/pgvector:pg18
+    container_name: ai_operations_manager_db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+
+    container_name: ai_operations_manager_api
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      - DATABASE_URL=postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-ai_operations_manager}
+
+    ports:
+      - "8000:8000"
+
+    volumes:
+      - ./backend:/app/backend
+      - ./agents:/app/agents
+      - ./rag:/app/rag
+      - ./integrations:/app/integrations
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+    command:
+      [
+        "uvicorn",
+        "backend.app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload"
+      ]
+
+
+volumes:
+  postgres_data:

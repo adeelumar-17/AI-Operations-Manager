@@ -1,0 +1,11 @@
+{
+  "_comment": "Sample payload that EventBridge Scheduler sends to the Lambda function. The Lambda Web Adapter converts this to a POST request to /api/v1/internal/run-followups.",
+  "httpMethod": "POST",
+  "path": "/api/v1/internal/run-followups",
+  "headers": {
+    "Content-Type": "application/json",
+    "X-Scheduler-Secret": "your-random-secret-here"
+  },
+  "body": "",
+  "isBase64Encoded": false
+}

@@ -1,0 +1,24 @@
+fastapi
+uvicorn[standard]
+sqlalchemy
+alembic
+psycopg[binary]
+psycopg2-binary
+pydantic-settings
+pgvector
+
+# LLM — Groq (fast inference, free tier)
+langchain
+langchain-groq
+langchain-community
+
+# Embeddings — local sentence-transformers (no API key required)
+# Produces 384-dim vectors matching VECTOR(384) in the DB schema
+sentence-transformers
+
+# Agent graph orchestration & persistence
+langgraph
+langgraph-checkpoint-sqlite
+
+# Scheduling
+apscheduler

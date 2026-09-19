@@ -1,0 +1,86 @@
+[
+  {
+    "id": "CASE-01",
+    "workflow": "inventory_check",
+    "prompt": "Can we fulfill an order of 50 units of SKU-1234?",
+    "expect_approval": false,
+    "description": "Stock feasibility check for standard item"
+  },
+  {
+    "id": "CASE-02",
+    "workflow": "inventory_check",
+    "prompt": "Check current stock levels for Widget Pro SKU-9999.",
+    "expect_approval": false,
+    "description": "Stock lookup by SKU"
+  },
+  {
+    "id": "CASE-03",
+    "workflow": "create_quote",
+    "prompt": "Create a quote for Ahmed Industries with a 5% discount on 50 boxes of paper.",
+    "expect_approval": false,
+    "description": "Standard quote within 10% policy threshold"
+  },
+  {
+    "id": "CASE-04",
+    "workflow": "create_quote",
+    "prompt": "Create a quote for Alpha Logistics with a 15% discount on 200 monitors.",
+    "expect_approval": true,
+    "description": "Quote with 15% discount requiring manager approval"
+  },
+  {
+    "id": "CASE-05",
+    "workflow": "invoice_status",
+    "prompt": "Show me all overdue invoices across all accounts.",
+    "expect_approval": false,
+    "description": "Overdue invoices query"
+  },
+  {
+    "id": "CASE-06",
+    "workflow": "invoice_status",
+    "prompt": "What is the status of invoice INV-2024-001?",
+    "expect_approval": false,
+    "description": "Specific invoice lookup"
+  },
+  {
+    "id": "CASE-07",
+    "workflow": "customer_management",
+    "prompt": "Find customer profile for Ahmed Industries and show their history.",
+    "expect_approval": false,
+    "description": "Customer search and profile"
+  },
+  {
+    "id": "CASE-08",
+    "workflow": "customer_management",
+    "prompt": "What tier is Beta Corp and who is their account manager?",
+    "expect_approval": false,
+    "description": "Customer tier inspection"
+  },
+  {
+    "id": "CASE-09",
+    "workflow": "issue_resolution",
+    "prompt": "Customer received damaged packaging on order ORD-1002. They want a replacement.",
+    "expect_approval": false,
+    "description": "Standard replacement issue resolution"
+  },
+  {
+    "id": "CASE-10",
+    "workflow": "issue_resolution",
+    "prompt": "Customer requests an immediate $800 refund for damaged goods on order ORD-9900.",
+    "expect_approval": true,
+    "description": "Refund > $500 requiring manager approval"
+  },
+  {
+    "id": "CASE-11",
+    "workflow": "follow_up",
+    "prompt": "Follow up with all customers who have pending quotes older than 7 days.",
+    "expect_approval": false,
+    "description": "Bulk quote follow-up"
+  },
+  {
+    "id": "CASE-12",
+    "workflow": "follow_up",
+    "prompt": "Remind me to follow up with Ahmed Industries next Tuesday regarding the open proposal.",
+    "expect_approval": false,
+    "description": "Explicit reminder scheduling"
+  }
+]
