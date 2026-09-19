@@ -7,7 +7,7 @@ Methods:
 '''
 
 from langgraph.graph import StateGraph, END
-
+from typing import Any
 from agents.graph.state import (
     AgentState,
     WORKFLOW_INVENTORY,
