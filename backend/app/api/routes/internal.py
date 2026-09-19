@@ -13,17 +13,17 @@ Methods:
         process_due_followups() and returns how many tasks were processed.
 '''
 
-import os
+
 import logging
 from fastapi import APIRouter, Header, HTTPException, status
 
 from backend.app.scheduler.jobs import process_due_followups
-
+from backend.app.core.config import settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/internal", tags=["Internal"])
 
-_SCHEDULER_SECRET = os.getenv("SCHEDULER_SECRET", "")
+
 
 
 @router.post("/run-followups", status_code=200)
@@ -35,7 +35,7 @@ def trigger_followups(
     Requires the ``X-Scheduler-Secret`` header to match the ``SCHEDULER_SECRET``
     environment variable. Returns the number of tasks processed.
     """
-    if not _SCHEDULER_SECRET or x_scheduler_secret != _SCHEDULER_SECRET:
+    if not settings.SCHEDULER_SECRET or x_scheduler_secret != settings.SCHEDULER_SECRET:
         logger.warning("Rejected /internal/run-followups — bad or missing secret.")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

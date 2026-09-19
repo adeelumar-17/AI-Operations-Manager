@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     POSTGRES_PASSWORD: str = "postgres"
     DATABASE_URL: str
     DATABASE_URL_DIRECT: str = ""
+    SCHEDULER_SECRET: str = ""
 
     @field_validator("DATABASE_URL", "DATABASE_URL_DIRECT", mode="after")
     @classmethod
