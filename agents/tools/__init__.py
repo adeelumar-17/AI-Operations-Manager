@@ -18,6 +18,7 @@ from agents.tools.inventory_tools import (
     check_fulfillment_feasibility,
     get_low_stock_products,
     update_inventory,
+    get_all_products,
 )
 from agents.tools.quote_tools import (
     get_quote,
@@ -50,6 +51,7 @@ ALL_TOOLS = [
     check_fulfillment_feasibility,
     get_low_stock_products,
     update_inventory,
+    get_all_products,
     # Quotes
     get_quote,
     apply_discount_to_quote,

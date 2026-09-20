@@ -26,10 +26,7 @@ def list_customers(
 ):
     """Search or list customers."""
     repo = CustomerRepository(db)
-    if query:
-        customers = repo.search_by_name(query)
-    else:
-        customers = repo.list_all(limit=limit) if hasattr(repo, "list_all") else repo.search_by_name("")
+    customers = repo.search(query) if query else repo.list_all(limit=limit)
 
     return [
         {

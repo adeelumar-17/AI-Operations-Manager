@@ -217,3 +217,28 @@ def get_low_stock_products() -> str:
         return f"Error retrieving low-stock list: {e}"
     finally:
         session.close()
+
+@tool
+def get_all_products() -> str:
+    """List every product in the catalog, regardless of stock level.
+
+    Use when the user asks to see all products, the full catalog, or
+    "what do we sell" — as opposed to get_low_stock_products, which only
+    shows items needing reorder.
+    """
+    service, session = _make_inventory_service()
+    try:
+        products = service.product_repository.list_all()
+        if not products:
+            return "No products found in the catalog."
+        lines = [f"Full product catalog ({len(products)} items):"]
+        for p in products:
+            lines.append(
+                f"  - {p.name} (SKU: {p.sku}) | "
+                f"Stock: {p.stock_quantity} | Price: ${float(p.unit_price):.2f} | Category: {p.category}"
+            )
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error retrieving product catalog: {e}"
+    finally:
+        session.close()

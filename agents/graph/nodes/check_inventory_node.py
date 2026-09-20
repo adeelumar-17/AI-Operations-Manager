@@ -1,6 +1,6 @@
 '''
 what the file does?
-This module implements the check_inventory_node workflow node, invoking inventory tools via an LLM to check current product stock, adjust inventory levels, check order feasibility, and query low stock warnings.
+This module implements the check_inventory_node workflow node, invoking inventory tools via an LLM to check current product stock, adjust inventory levels, check order feasibility, query low stock warnings, and list the full product catalog.
 
 Classes:
     None (LangGraph workflow node module)
@@ -24,7 +24,7 @@ def _get_llm_with_tools() -> ChatGroq:
     # Only bind inventory-relevant tools for this workflow
     inventory_tools = [
         t for t in ALL_TOOLS
-        if t.name in ("check_stock", "update_inventory", "check_fulfillment_feasibility", "get_low_stock_products", "search_customer")
+        if t.name in ("check_stock", "update_inventory", "check_fulfillment_feasibility", "get_low_stock_products", "get_all_products", "search_customer")
     ]
     return llm.bind_tools(inventory_tools)
 
@@ -50,11 +50,18 @@ def check_inventory_node(state: AgentState) -> dict:
     context = "\n".join(context_parts)
     prompt = (
         f"{context}\n\n"
-        "Handle the user's inventory request: "
-        "- If the user asks how many items/units are available or checks stock, call check_stock (requested_quantity=0 if just checking current stock). "
-        "- If the user asks to add, restock, or adjust stock units, call update_inventory. "
-        "- If checking multiple products for order feasibility, call check_fulfillment_feasibility. "
-        "- If asking about inventory health or low stock, call get_low_stock_products."
+        "Handle the user's inventory request:\n"
+        "- If the user asks to list, see, or show ALL products, or asks about the full catalog "
+        "(not filtered by low stock), call get_all_products with no arguments.\n"
+        "- If the user asks how many items/units of a SPECIFIC product are available or checks "
+        "stock for one item, call check_stock (requested_quantity=0 if just checking current stock). "
+        "The product_id argument accepts a UUID, an exact SKU, OR a plain product name/partial name — "
+        "if the user only gave a name (e.g. 'ergonomic chair'), pass that name directly as product_id "
+        "exactly as the user wrote it. Do not ask the user for a SKU if they have already given a name; "
+        "the tool will resolve the name itself.\n"
+        "- If the user asks to add, restock, or adjust stock units, call update_inventory.\n"
+        "- If checking multiple products for order feasibility, call check_fulfillment_feasibility.\n"
+        "- If asking specifically about low stock or what needs restocking, call get_low_stock_products."
     )
 
     try:

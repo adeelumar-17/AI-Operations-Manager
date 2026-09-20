@@ -1,11 +1,11 @@
 '''
-This module defines the CustomerRepository class, which provides methods for interacting with the Customer model in the database. The repository allows searching for customers based on a query string and retrieving a customer by their unique identifier (UUID).
+This module defines the CustomerRepository class, which provides methods for interacting with the Customer model in the database. The repository allows listing all customers, searching for customers based on a query string, and retrieving a customer by their unique identifier (UUID).
 Classes:
     CustomerRepository: A class that provides methods for interacting with the Customer model.
 Methods:
+    list_all: Retrieves all customers, ordered by name, up to an optional limit.
     search: Searches for customers based on a query string.
     get_by_id: Retrieves a customer by their unique identifier (UUID).
-
 '''
 from uuid import UUID
 
@@ -18,6 +18,10 @@ from backend.app.db.models.customer import Customer
 class CustomerRepository:
     def __init__(self, session: Session):
         self.session = session
+
+    def list_all(self, limit: int = 50) -> list[Customer]:
+        statement = select(Customer).order_by(Customer.name).limit(limit)
+        return list(self.session.scalars(statement).all())
 
     def search(self, query: str) -> list[Customer]:
         statement = (

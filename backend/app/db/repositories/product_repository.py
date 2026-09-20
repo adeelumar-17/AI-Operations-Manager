@@ -30,14 +30,31 @@ class ProductRepository:
         return self.session.scalars(statement).first()
 
     def search_by_name_or_sku(self, query: str) -> list[Product]:
-        from sqlalchemy import or_
-        q = f"%{query.strip()}%"
-        statement = select(Product).where(
-            or_(
-                Product.sku.ilike(q),
-                Product.name.ilike(q),
-            )
+        from sqlalchemy import or_, and_
+
+        q = query.strip()
+        if not q:
+            return []
+
+        # Exact SKU or full-string match first (fast path, most precise)
+        exact = select(Product).where(
+            or_(Product.sku.ilike(q), Product.name.ilike(f"%{q}%"))
         )
+        results = list(self.session.scalars(exact).all())
+        if results:
+            return results
+
+        # Fallback: match if every word in the query appears somewhere in the
+        # product name or SKU, tolerating plural/singular and word-order differences
+        # (e.g. "ergonomic chairs" matching "Ergonomic Chair")
+        words = [w for w in q.split() if w]
+        if not words:
+            return []
+        conditions = [
+            or_(Product.name.ilike(f"%{w.rstrip('s')}%"), Product.sku.ilike(f"%{w}%"))
+            for w in words
+        ]
+        statement = select(Product).where(and_(*conditions))
         return list(self.session.scalars(statement).all())
 
     def list_all(self) -> list[Product]:
