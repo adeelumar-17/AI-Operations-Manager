@@ -6,10 +6,9 @@ Classes:
     Settings: Application settings schema defining database connection strings, embedding configurations, and Groq LLM options.
 
 Methods:
-    resolve_database_host: Validator adjusting Docker container hostnames to localhost when running outside container networks.
+    resolve_database_url: Validator normalizing database connection strings to the postgresql+psycopg dialect.
 '''
 
-import socket
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -26,7 +25,7 @@ class Settings(BaseSettings):
     @field_validator("DATABASE_URL", "DATABASE_URL_DIRECT", mode="after")
     @classmethod
     def resolve_database_url(cls, v: str) -> str:
-        """Normalize driver dialect to postgresql+psycopg and resolve Docker container hostnames if needed."""
+        """Normalize driver dialect to postgresql+psycopg while preserving TLS parameters."""
         if not v:
             return v
         # Ensure postgresql+psycopg dialect prefix if standard postgres:// or postgresql:// is provided
@@ -34,13 +33,6 @@ class Settings(BaseSettings):
             v = "postgresql+psycopg://" + v[len("postgres://"):]
         elif v.startswith("postgresql://") and not v.startswith("postgresql+"):
             v = "postgresql+psycopg://" + v[len("postgresql://"):]
-
-        # If host is 'db' (Docker network) but host machine cannot resolve it, fallback to 'localhost'
-        if "@db:" in v or "@db/" in v:
-            try:
-                socket.gethostbyname("db")
-            except (socket.gaierror, OSError):
-                return v.replace("@db:", "@localhost:").replace("@db/", "@localhost/")
         return v
 
     # Embedding backend: 'sentence-transformers' (local, free) | 'openai'
@@ -54,10 +46,14 @@ class Settings(BaseSettings):
     GROQ_MAX_TOKENS: int = 2048
     GROQ_REASONING_EFFORT: str = "medium"
 
+    # Hugging Face token (optional, for higher rate limits)
+    HF_TOKEN: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=True,
+        extra="ignore",
     )
 
 

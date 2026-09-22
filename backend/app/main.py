@@ -60,7 +60,13 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(api_router)
 
@@ -69,3 +75,10 @@ app.include_router(api_router)
 def health_check():
     """Service health check endpoint."""
     return {"status": "ok", "service": "AI Operations Manager"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("backend.app.main:app", host="0.0.0.0", port=port, reload=False)
