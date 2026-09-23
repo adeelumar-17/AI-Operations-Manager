@@ -293,7 +293,8 @@ The application runs natively as a Python ASGI service without any Docker requir
 2. **Create a Web Service**:
    - **Environment**: `Python 3`
    - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT` *(or let Render auto-detect the root `Procfile`)*
+   - **Start Command**: `python -m alembic upgrade head && uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT`
+   - Update an existing service's configured Start Command too; changing the repository's `Procfile` does not replace a command already configured in the dashboard.
 3. **Set Environment Variables**:
 
 | Variable | Required | Default / Format | Description |
@@ -306,6 +307,8 @@ The application runs natively as a Python ASGI service without any Docker requir
 | `HF_TOKEN` | No | `hf_...` | Hugging Face token for higher rate limits. |
 | `EMBEDDING_BACKEND` | No | `sentence-transformers` | `sentence-transformers` (local) or `openai`. |
 | `GROQ_MODEL` | No | `openai/gpt-oss-120b` | Groq LLM model name. |
+
+Migrations must finish before the scheduler starts. Both database URLs must target the same database and schema; Alembic prefers `DATABASE_URL_DIRECT`. Migration `004` adds `followup_tasks.started_at`. If logs report that column is missing, run `python -m alembic upgrade head` in the service shell, then `python -m alembic current` to verify the migration revision, and restart the service. Do not use `alembic stamp` to repair a missing column: stamping records a revision without applying its schema changes.
 
 > [!TIP]
 > **Free Tier Memory Advisory**:
