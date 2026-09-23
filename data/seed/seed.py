@@ -15,7 +15,8 @@ Usage:
 import sys
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from uuid import uuid4
+from uuid import UUID, uuid4
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -41,20 +42,27 @@ def seed_database():
         today = date.today()
 
         # 1. Users
-        manager_user = db.query(User).filter(User.email == "manager@officehub.com").first()
-        if not manager_user:
-            manager_user = User(
-                id=uuid4(),
-                email="manager@officehub.com",
-                hashed_password="pbkdf2:sha256:fakehashformanager",
-                full_name="Operations Manager",
-                role="manager",
-                is_active=True,
-                created_at=now,
-            )
-            db.add(manager_user)
-            db.commit()
-            print("✓ Created manager user account.")
+        demo_users = [
+            ("a0000000-0000-0000-0000-000000000001", "admin@officehub.com", "Ahmad Al-Rashid", "admin"),
+            ("36ae02ac-133d-4ff0-969c-b879d2eb2820", "manager@officehub.com", "Sara Malik", "manager"),
+            ("a0000000-0000-0000-0000-000000000003", "operator@officehub.com", "Ali Hassan", "staff"),
+        ]
+        for uid_str, email, name, role in demo_users:
+            u = db.query(User).filter(User.email == email).first()
+            if not u:
+                u = User(
+                    id=UUID(uid_str),
+                    email=email,
+                    hashed_password="pbkdf2:sha256:fakehashformanager",
+                    full_name=name,
+                    role=role,
+                    is_active=True,
+                    created_at=now,
+                )
+                db.add(u)
+        db.commit()
+        print("✓ Created/verified demo user accounts (admin, manager, staff).")
+
 
         # 2. Customers
         cust_ahmed = db.query(Customer).filter(Customer.name == "Ahmed Industries").first()
