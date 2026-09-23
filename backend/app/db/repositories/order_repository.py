@@ -65,12 +65,17 @@ class OrderRepository:
         return result
 
     def get_with_items(self, order_id: UUID) -> Order | None:
+        try:
+            predicate = Order.id == UUID(str(order_id))
+        except ValueError:
+            predicate = Order.order_number == str(order_id)
         statement = (
             select(Order)
-            .where(Order.id == order_id)
+            .where(predicate)
             .options(
                 selectinload(Order.items),
             )
+            .with_for_update()
         )
 
         result = self.session.scalars(statement).one_or_none()

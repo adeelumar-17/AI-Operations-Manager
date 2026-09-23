@@ -1,104 +1,41 @@
-'''
-what the file does?
-This module implements the check_inventory_node workflow node, invoking inventory tools via an LLM to check current product stock, adjust inventory levels, check order feasibility, query low stock warnings, and list the full product catalog.
-
-Classes:
-    None (LangGraph workflow node module)
-
-Methods:
-    _get_llm_with_tools: Binds inventory-specific LangChain tools to the LLM.
-    check_inventory_node: Workflow node that executes inventory queries and updates, returning action results to state.
-'''
-
-from langchain_groq import ChatGroq
-from langchain_core.messages import SystemMessage, HumanMessage
-
+"""Inventory queries and adjustments"""
+import logging
+from datetime import datetime, timezone
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from agents.graph.state import AgentState
 from agents.tools import ALL_TOOLS
 from agents.prompts.prompts import SYSTEM_PROMPT
 from agents.llm import get_llm
 
+logger = logging.getLogger(__name__)
 
-def _get_llm_with_tools() -> ChatGroq:
-    llm = get_llm()
-    # Only bind inventory-relevant tools for this workflow
-    inventory_tools = [
-        t for t in ALL_TOOLS
-        if t.name in ("check_stock", "update_inventory", "check_fulfillment_feasibility", "get_low_stock_products", "get_all_products", "search_customer")
-    ]
-    return llm.bind_tools(inventory_tools)
+
+def _get_tools_for_inventory() -> list:
+    relevant = {"check_stock", "update_inventory", "check_fulfillment_feasibility", "get_low_stock_products", "get_all_products", "search_customer", "get_order_status", "fulfill_order", "update_order_status"}
+    return [t for t in ALL_TOOLS if t.name in relevant]
 
 
 def check_inventory_node(state: AgentState) -> dict:
-    """Execute the inventory / fulfillment check workflow.
-
-    Calls inventory tools based on the user's request and entities,
-    then returns the tool results in action_results.
-    """
-    user_input = state["user_input"]
-    entities = state.get("entities", {})
-
-    # Build context-aware prompt
-    context_parts = [f"User request: {user_input}"]
-    if entities.get("product_names"):
-        context_parts.append(f"Products mentioned: {', '.join(entities['product_names'])}")
-    if entities.get("quantities"):
-        context_parts.append(f"Quantities mentioned: {entities['quantities']}")
-    if entities.get("product_skus"):
-        context_parts.append(f"SKUs mentioned: {', '.join(entities['product_skus'])}")
-
-    context = "\n".join(context_parts)
-    prompt = (
-        f"{context}\n\n"
-        "Handle the user's inventory request:\n"
-        "- If the user asks to list, see, or show ALL products, or asks about the full catalog "
-        "(not filtered by low stock), call get_all_products with no arguments.\n"
-        "- If the user asks how many items/units of a SPECIFIC product are available or checks "
-        "stock for one item, call check_stock (requested_quantity=0 if just checking current stock). "
-        "The product_id argument accepts a UUID, an exact SKU, OR a plain product name/partial name — "
-        "if the user only gave a name (e.g. 'ergonomic chair'), pass that name directly as product_id "
-        "exactly as the user wrote it. Do not ask the user for a SKU if they have already given a name; "
-        "the tool will resolve the name itself.\n"
-        "- If the user asks to add, restock, or adjust stock units, call update_inventory.\n"
-        "- If checking multiple products for order feasibility, call check_fulfillment_feasibility.\n"
-        "- If asking specifically about low stock or what needs restocking, call get_low_stock_products."
-    )
-
+    results = []
     try:
-        llm = _get_llm_with_tools()
-        messages = [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=prompt),
-        ]
-        response = llm.invoke(messages)
-
-        # Execute any tool calls the LLM requested
-        tool_results = []
-        if hasattr(response, "tool_calls") and response.tool_calls:
-            from langchain_core.messages import ToolMessage
-            for tool_call in response.tool_calls:
-                tool_fn = next(
-                    (t for t in ALL_TOOLS if t.name == tool_call["name"]), None
-                )
-                if tool_fn:
-                    result = tool_fn.invoke(tool_call["args"])
-                    tool_results.append({
-                        "tool": tool_call["name"],
-                        "args": tool_call["args"],
-                        "result": result,
-                    })
-
-        # If no tool calls, treat the LLM's direct response as the result
-        if not tool_results:
-            tool_results = [{"tool": "direct_response", "result": response.content}]
-
-        return {
-            "action_plan": [{"action": "check_inventory", "entities": entities}],
-            "action_results": tool_results,
-        }
-
-    except Exception as e:
-        return {
-            "action_results": [],
-            "error": f"Inventory check failed: {e}",
-        }
+        tools = {t.name: t for t in _get_tools_for_inventory()}
+        llm = get_llm().bind_tools(list(tools.values()))
+        prompt = state['user_input'] + '\nCurrent UTC time: ' + datetime.now(timezone.utc).isoformat() + '\nUse tools for catalog, stock, restocking and fulfillment. Resolve ambiguous products before changing stock. Use multiple tool rounds when a request depends on earlier results. Only perform requested changes.'
+        messages = [SystemMessage(content=SYSTEM_PROMPT), *state.get('messages', [])[-20:], HumanMessage(content=prompt)]
+        for _ in range(6):
+            response = llm.invoke(messages)
+            messages.append(response)
+            if not response.tool_calls:
+                results.append({'tool': 'direct_response', 'result': response.content})
+                break
+            for call in response.tool_calls:
+                tool = tools.get(call['name'])
+                result = tool.invoke(call['args']) if tool else 'Error: tool unavailable in this workflow.'
+                results.append({'tool': call['name'], 'args': call['args'], 'result': result})
+                messages.append(ToolMessage(content=str(result), tool_call_id=call['id']))
+        else:
+            return {'action_results': results, 'error': 'Tool limit reached; remaining actions were not completed.'}
+        return {'action_results': results, 'action_plan': [{'action': 'check_inventory', 'entities': state.get('entities', {})}]}
+    except Exception as exc:
+        logger.exception('Inventory queries and adjustments failed')
+        return {'action_results': results, 'error': str(exc)}

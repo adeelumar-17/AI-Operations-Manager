@@ -1,176 +1,165 @@
-'''
-This module defines the AgentService interface, serving as the single decoupled entry point for invoking and resuming the LangGraph operations agent. It is called by both FastAPI HTTP endpoints and APScheduler background jobs.
-Classes:
-    None (Agent facade and execution service module).
-Methods:
-    run_agent: Executes a single user operational prompt through the compiled LangGraph StateGraph, managing thread checkpoints and detecting policy interruptions.
-    resume_agent: Resumes an interrupted workflow from a durable checkpoint when a manager approves or rejects an intercepted action.
-'''
-
-import uuid
-from typing import Any, Optional
-
+"""Agent invocation, serialized approval resumption, and execution telemetry."""
+import logging
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from hashlib import sha256
+from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
+from sqlalchemy import text, create_engine
+from sqlalchemy.pool import NullPool
 from langgraph.types import Command
-
+from langchain_core.messages import HumanMessage, AIMessage
 from agents.graph.graph import agent_graph
-from agents.graph.state import AgentState
+from backend.app.db.database import SessionLocal, engine
+from backend.app.db.models.agent_run import AgentRun
+from backend.app.db.models.audit_log import AuditLog
+from backend.app.db.models.approval_request import ApprovalRequest
+from backend.app.services.approval_service import ApprovalService
+
+logger = logging.getLogger(__name__)
+_lock_engine = create_engine(engine.url, poolclass=NullPool, pool_pre_ping=True)
 
 
-def run_agent(
-    user_input: str,
-    conversation_id: str | None = None,
-    request_id: str | None = None,
-    conversation_history: list[dict] | None = None,
-    thread_id: str | None = None,
-) -> dict[str, Any]:
-    """Invoke the operations agent for a single user request.
-
-    Args:
-        user_input: The raw user message.
-        conversation_id: Optional — links this run to an ongoing conversation.
-        request_id: Optional — unique ID for this run; auto-generated if absent.
-        conversation_history: Optional — bounded list of prior messages to include as context.
-        thread_id: Optional — persistence thread ID for LangGraph checkpointer. Defaults to conversation_id or request_id.
-
-    Returns:
-        A dict with at minimum:
-          - "request_id": str
-          - "thread_id": str
-          - "response": the agent's natural-language response
-          - "workflow": which workflow was selected
-          - "intent": the detected intent
-          - "approval_required": bool
-          - "approval_id": str | None
-          - "approval_decision": str | None
-          - "error": str | None
-    """
-    req_id = request_id or str(uuid.uuid4())
-    active_thread = thread_id or conversation_id or req_id
-
-    initial_state: AgentState = {
-        "request_id": req_id,
-        "user_input": user_input,
-        "conversation_id": conversation_id,
-        "intent": None,
-        "workflow": None,
-        "entities": {},
-        "action_plan": [],
-        "action_results": [],
-        "approval_required": False,
-        "approval_id": None,
-        "approval_decision": None,
-        "response": None,
-        "error": None,
-        "messages": conversation_history or [],
-    }
-
-    config = {"configurable": {"thread_id": active_thread}}
-    final_state = agent_graph.invoke(initial_state, config=config)
-
-    # Check for LangGraph interrupt
-    interrupt_info = None
-    if "__interrupt__" in final_state and final_state["__interrupt__"]:
-        interrupt_info = final_state["__interrupt__"][0].value
-
-    approval_required = final_state.get("approval_required", False) or bool(interrupt_info)
-    approval_id = final_state.get("approval_id")
-
-    if interrupt_info and isinstance(interrupt_info, dict):
-        approval_id = interrupt_info.get("approval_id") or approval_id
-
-    response_text = final_state.get("response")
-    if not response_text:
-        if approval_required:
-            response_text = (
-                "Action requires managerial approval before proceeding. "
-                f"Approval Request ID: {approval_id or 'pending'}. "
-                "The operation is safely paused and will resume once reviewed."
-            )
-        else:
-            response_text = "No response generated."
-
-    return {
-        "request_id": final_state.get("request_id", req_id),
-        "thread_id": active_thread,
-        "response": response_text,
-        "workflow": final_state.get("workflow"),
-        "intent": final_state.get("intent"),
-        "entities": final_state.get("entities", {}),
-        "action_results": final_state.get("action_results", []),
-        "approval_required": approval_required,
-        "approval_id": approval_id,
-        "approval_decision": final_state.get("approval_decision"),
-        "error": final_state.get("error"),
-    }
+@contextmanager
+def _thread_lock(thread_id):
+    # Transaction-scoped advisory lock is released even if invocation raises.
+    # It serializes only this checkpoint thread, not unrelated agent requests.
+    key = int.from_bytes(sha256(thread_id.encode()).digest()[:8], 'big', signed=True)
+    # A dedicated connection cannot exhaust the normal tool-session pool while
+    # waiting on an LLM. NullPool closes it as soon as this invocation ends.
+    with _lock_engine.begin() as conn:
+        if not conn.scalar(text('SELECT pg_try_advisory_xact_lock(:key)'), {'key': key}):
+            raise ValueError('This conversation is already being processed; retry shortly.')
+        yield
 
 
-def resume_agent(
-    approval_id: str,
-    approved: bool,
-    thread_id: Optional[str] = None,
-    comment: str = "",
-    reviewer_id: Optional[str] = None,
-) -> dict[str, Any]:
-    """Resume an interrupted agent workflow with a managerial approval decision.
+def _result(state, thread_id, request_id=None):
+    interruptions = state.get('__interrupt__') or []
+    pending = interruptions[0].value if interruptions else {}
+    approval_id = pending.get('approval_id') or state.get('approval_id')
+    required = bool(pending) or state.get('approval_required', False)
+    return {'request_id': state.get('request_id', request_id), 'thread_id': thread_id,
+            'response': state.get('response') or ('Manager approval required; the operation is paused.' if pending else 'No response generated.'),
+            'workflow': state.get('workflow'), 'intent': state.get('intent'),
+            'entities': state.get('entities', {}), 'action_results': state.get('action_results', []),
+            'approval_required': required, 'approval_id': approval_id,
+            'approval_decision': state.get('approval_decision'), 'error': state.get('error')}
 
-    Args:
-        approval_id: The ID of the pending approval request.
-        approved: True to approve the action; False to reject.
-        thread_id: Optional thread ID. If absent, retrieved from the DB approval record.
-        comment: Optional reviewer comment.
-        reviewer_id: Optional user ID of the reviewer.
 
-    Returns:
-        The updated agent run result after continuing from the checkpoint.
-    """
-    resolved_thread = thread_id
-
-    # Sync with DB approval_requests table if DB is accessible
+def _record_run(result, user_input=''):
     try:
-        from backend.app.db.database import SessionLocal
-        from backend.app.services.approval_service import ApprovalService
+        request_id = result['request_id']
+        run_id = uuid5(NAMESPACE_URL, 'officehub:run:' + request_id)
+        with SessionLocal() as db:
+            run = db.get(AgentRun, run_id)
+            if run is None:
+                run = AgentRun(id=run_id, request_id=request_id, started_at=datetime.now(timezone.utc))
+                db.add(run)
+            run.intent = result.get('intent')
+            run.error = result.get('error')
+            run.status = ('failed' if run.error else 'waiting_approval' if result.get('approval_required') and not result.get('approval_decision') else 'completed')
+            run.completed_at = None if run.status == 'waiting_approval' else datetime.now(timezone.utc)
+            db.flush()
+            for action in result.get('action_results') or [{'tool': None, 'result': result['response']}]:
+                db.add(AuditLog(id=uuid4(), run_id=run_id, node=result.get('workflow') or 'agent',
+                                tool=action.get('tool'), input={'user_input': user_input, 'args': action.get('args', {})},
+                                output={'result': str(action.get('result', ''))}, error=run.error,
+                                approval_status=result.get('approval_decision'), timestamp=datetime.now(timezone.utc)))
+            if result.get('approval_id'):
+                approval = db.get(ApprovalRequest, UUID(result['approval_id']))
+                if approval:
+                    approval.run_id = run_id
+            db.commit()
+    except Exception:
+        logger.exception('Failed to persist agent telemetry')
+
+
+def _begin_run(request_id):
+    try:
+        with SessionLocal() as db:
+            run_id = uuid5(NAMESPACE_URL, 'officehub:run:' + request_id)
+            if db.get(AgentRun, run_id) is None:
+                db.add(AgentRun(id=run_id, request_id=request_id, status='running', started_at=datetime.now(timezone.utc)))
+                db.commit()
+    except Exception:
+        logger.exception('Failed to record agent start')
+
+
+def run_agent(user_input: str, conversation_id=None, request_id=None, conversation_history=None, thread_id=None) -> dict:
+    request_id = request_id or str(uuid4())
+    thread_id = thread_id or conversation_id or request_id
+    config = {'configurable': {'thread_id': thread_id}}
+    initial = {'request_id': request_id, 'user_input': user_input, 'conversation_id': conversation_id,
+               'intent': None, 'workflow': None, 'entities': {}, 'action_plan': [], 'action_results': [],
+               'approval_required': False, 'approval_id': None, 'approval_decision': None,
+               'response': None, 'error': None, 'messages': (conversation_history or [])[-20:]}
+    with _thread_lock(thread_id):
+        snapshot = agent_graph.get_state(config)
+        if snapshot.next or any(task.error or task.interrupts for task in snapshot.tasks):
+            raise ValueError('This conversation has a pending operation; resolve it before sending another request.')
+        state = initial
+        _begin_run(request_id)
+        try:
+            state = agent_graph.invoke(initial, config=config)
+            result = _result(state, thread_id, request_id)
+        except Exception as exc:
+            logger.exception('Agent invocation failed')
+            result = _result({**initial, 'error': str(exc), 'response': 'The request failed; check the error and retry.'}, thread_id)
+        _record_run(result, user_input)
+        if not state.get('__interrupt__') and not result.get('error'):
+            agent_graph.update_state(config, {'messages': [HumanMessage(content=user_input, id=request_id + ':user'),
+                                                          AIMessage(content=result['response'], id=request_id + ':assistant')]})
+        return result
+
+
+def resume_agent(approval_id: str, approved: bool, thread_id=None, comment='', reviewer_id=None) -> dict:
+    with SessionLocal() as db:
+        record = ApprovalService(db).get_approval(approval_id)
+        if record is None:
+            raise ValueError('Approval not found.')
+        saved_thread = record.action_payload.get('thread_id')
+        if not saved_thread or (thread_id and thread_id != saved_thread):
+            raise ValueError('Approval has no matching checkpoint thread.')
+    with _thread_lock(saved_thread):
         with SessionLocal() as db:
             service = ApprovalService(db)
-            if approved:
-                rec = service.approve(approval_id, approved_by=reviewer_id)
-            else:
-                rec = service.reject(approval_id, approved_by=reviewer_id)
-
-            if rec and not resolved_thread and rec.action_payload:
-                resolved_thread = rec.action_payload.get("thread_id")
-    except Exception:
-        pass
-
-    if not resolved_thread:
-        # Fallback to approval_id itself if thread not found
-        resolved_thread = approval_id
-
-    config = {"configurable": {"thread_id": resolved_thread}}
-    resume_payload = {
-        "approved": approved,
-        "comment": comment,
-        "reviewer_id": reviewer_id,
-        "approval_id": approval_id,
-    }
-
-    # Resume graph from the checkpoint
-    final_state = agent_graph.invoke(Command(resume=resume_payload), config=config)
-
-    decision_str = "approved" if approved else "rejected"
-    response_text = final_state.get("response") or (
-        f"Operation successfully resumed with decision: {decision_str.upper()}."
-    )
-
-    return {
-        "request_id": final_state.get("request_id"),
-        "thread_id": resolved_thread,
-        "response": response_text,
-        "workflow": final_state.get("workflow"),
-        "intent": final_state.get("intent"),
-        "entities": final_state.get("entities", {}),
-        "action_results": final_state.get("action_results", []),
-        "approval_required": True,
-        "approval_id": approval_id,
-        "approval_decision": decision_str,
-        "error": final_state.get("error"),
-    }
+            record = service.approve(approval_id, reviewer_id) if approved else service.reject(approval_id, reviewer_id)
+            payload = dict(record.action_payload)
+            if payload.get('final_result'):
+                return payload['final_result']
+            payload['review_comment'] = comment
+            record.action_payload = payload
+            db.commit()
+        config = {'configurable': {'thread_id': saved_thread}}
+        snapshot = agent_graph.get_state(config)
+        if not snapshot.next and not any(task.error or task.interrupts for task in snapshot.tasks):
+            # Recover a crash between graph completion and response persistence.
+            if snapshot.values.get('approval_id') != approval_id or not snapshot.values.get('approval_decision'):
+                raise ValueError('No resumable checkpoint matches this approval.')
+            state = snapshot.values
+        else:
+            pending_ids = {i.value.get('approval_id') for task in snapshot.tasks for i in task.interrupts if isinstance(i.value, dict)}
+            if pending_ids and approval_id not in pending_ids:
+                raise ValueError('Checkpoint is waiting for a different approval.')
+            if snapshot.values.get('request_id') != payload['request_id']:
+                raise ValueError('Checkpoint belongs to another request.')
+            command = Command(resume={'approved': approved, 'approval_id': approval_id,
+                                      'reviewer_id': reviewer_id, 'comment': comment}) if pending_ids else None
+            try:
+                state = agent_graph.invoke(command, config=config)
+            except Exception as exc:
+                logger.exception('Approval execution failed; the same decision can be retried')
+                _record_run(_result({**snapshot.values, 'error': str(exc),
+                                     'approval_id': approval_id, 'approval_required': True,
+                                     'approval_decision': 'approved' if approved else 'rejected',
+                                     'response': 'Execution failed; retry the same approval decision.'}, saved_thread))
+                raise
+        result = _result(state, saved_thread)
+        if result.get('error'):
+            # Preserve the decision and surface failure; never claim execution.
+            logger.error('Approved workflow failed: %s', result['error'])
+        with SessionLocal() as db:
+            record = db.get(ApprovalRequest, UUID(approval_id))
+            record.action_payload = {**record.action_payload, 'final_result': result}
+            db.commit()
+        _record_run(result)
+        return result

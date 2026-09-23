@@ -28,6 +28,7 @@ from agents.graph.nodes.customer_mgmt_node import customer_mgmt_node
 from agents.graph.nodes.resolve_issue_node import resolve_issue_node
 from agents.graph.nodes.followup_node import followup_node
 from agents.graph.nodes.formulate_response import formulate_response
+from backend.app.core.audit import audit_node
 
 
 def build_graph(checkpointer=None) -> Any:
@@ -41,21 +42,21 @@ def build_graph(checkpointer=None) -> Any:
     graph = StateGraph(AgentState)
 
     # --- Routing nodes (every request passes through all four) ---------------
-    graph.add_node("parse_request", parse_request)
-    graph.add_node("classify_intent", classify_intent)
-    graph.add_node("identify_entities", identify_entities)
-    graph.add_node("select_workflow", select_workflow)
+    graph.add_node("parse_request", audit_node("parse_request")(parse_request))
+    graph.add_node("classify_intent", audit_node("classify_intent")(classify_intent))
+    graph.add_node("identify_entities", audit_node("identify_entities")(identify_entities))
+    graph.add_node("select_workflow", audit_node("select_workflow")(select_workflow))
 
     # --- Workflow nodes (only one is visited per run) ------------------------
-    graph.add_node(WORKFLOW_INVENTORY, check_inventory_node)
-    graph.add_node(WORKFLOW_QUOTE, create_quote_node)
-    graph.add_node(WORKFLOW_INVOICE, check_invoice_node)
-    graph.add_node(WORKFLOW_CUSTOMER, customer_mgmt_node)
-    graph.add_node(WORKFLOW_ISSUE, resolve_issue_node)
-    graph.add_node(WORKFLOW_FOLLOWUP, followup_node)
+    graph.add_node(WORKFLOW_INVENTORY, audit_node(WORKFLOW_INVENTORY)(check_inventory_node))
+    graph.add_node(WORKFLOW_QUOTE, audit_node(WORKFLOW_QUOTE)(create_quote_node))
+    graph.add_node(WORKFLOW_INVOICE, audit_node(WORKFLOW_INVOICE)(check_invoice_node))
+    graph.add_node(WORKFLOW_CUSTOMER, audit_node(WORKFLOW_CUSTOMER)(customer_mgmt_node))
+    graph.add_node(WORKFLOW_ISSUE, audit_node(WORKFLOW_ISSUE)(resolve_issue_node))
+    graph.add_node(WORKFLOW_FOLLOWUP, audit_node(WORKFLOW_FOLLOWUP)(followup_node))
 
     # --- Response node (every path converges here) ---------------------------
-    graph.add_node("formulate_response", formulate_response)
+    graph.add_node("formulate_response", audit_node("formulate_response")(formulate_response))
 
     # --- Edges ---------------------------------------------------------------
     graph.set_entry_point("parse_request")

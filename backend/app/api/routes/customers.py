@@ -8,7 +8,8 @@ Methods:
 '''
 
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from backend.app.services.authorization_service import customer_tier
 from sqlalchemy.orm import Session
 
 from backend.app.api.dependencies import get_db, get_current_user
@@ -20,13 +21,13 @@ router = APIRouter(prefix="/customers", tags=["Customers"])
 @router.get("")
 def list_customers(
     query: str | None = None,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user),
 ):
     """Search or list customers."""
     repo = CustomerRepository(db)
-    customers = repo.search(query) if query else repo.list_all(limit=limit)
+    customers = repo.search(query, limit=limit) if query else repo.list_all(limit=limit)
 
     return [
         {
@@ -34,7 +35,7 @@ def list_customers(
             "name": c.name,
             "email": c.email,
             "company_name": c.company_name,
-            "tier": getattr(c, "tier", "regular"),
+            "tier": customer_tier(c),
         }
         for c in customers
     ]
@@ -56,5 +57,5 @@ def get_customer(
         "name": customer.name,
         "email": customer.email,
         "company_name": customer.company_name,
-        "tier": getattr(customer, "tier", "regular"),
+        "tier": customer_tier(customer),
     }

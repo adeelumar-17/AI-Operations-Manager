@@ -35,10 +35,15 @@ class InvoiceRepository:
         return result
 
     def get_with_payments(self, invoice_id: UUID) -> Invoice | None:
+        try:
+            predicate = Invoice.id == UUID(str(invoice_id))
+        except ValueError:
+            predicate = Invoice.invoice_id == str(invoice_id)
         statement = (
             select(Invoice)
-            .where(Invoice.id == invoice_id)
+            .where(predicate)
             .options(selectinload(Invoice.payments))
+            .with_for_update()
         )
         result = self.session.scalars(statement).one_or_none()
         return result

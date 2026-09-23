@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 '''
 what the file does?
 This module implements the classify_intent graph node, which uses an LLM call (with keyword fallback) to categorize user requests into one of the six supported business workflows.
@@ -11,12 +13,12 @@ Methods:
     _keyword_fallback: Rule-based heuristic fallback to classify intent based on keywords when LLM fails.
 '''
 
-import re
+
 
 from langchain_groq import ChatGroq
 
 from agents.graph.state import AgentState, ALL_WORKFLOWS
-from agents.prompts.prompts import INTENT_CLASSIFICATION_PROMPT, SYSTEM_PROMPT
+from agents.prompts.prompts import INTENT_CLASSIFICATION_PROMPT
 from agents.llm import get_llm
 
 
@@ -35,11 +37,11 @@ def classify_intent(state: AgentState) -> dict:
     if not user_input:
         return {"intent": "customer_management", "error": "Empty user input"}
 
-    llm = _get_llm()
     prompt = INTENT_CLASSIFICATION_PROMPT.format(user_input=user_input)
 
     try:
-        response = llm.invoke(prompt)
+        llm = _get_llm()
+        response = llm.invoke([*state.get("messages", [])[-20:], ("human", prompt)])
         raw_intent = response.content.strip().lower()
 
         # Extract the workflow name from the response (handles extra text gracefully)
@@ -56,19 +58,23 @@ def classify_intent(state: AgentState) -> dict:
         return {"intent": detected_intent}
 
     except Exception as e:
+        logger.exception('Operation failed')
         return {
             "intent": _keyword_fallback(user_input),
-            "error": f"Intent classification error (using keyword fallback): {e}",
         }
 
 
 def _keyword_fallback(user_input: str) -> str:
     """Simple keyword-based fallback when LLM classification fails."""
     text = user_input.lower()
+    if any(w in text for w in ["complaint", "refund", "wrong", "return"]):
+        return "issue_resolution"
+    if any(w in text for w in ["follow", "remind", "check in"]):
+        return "follow_up"
 
     if any(w in text for w in ["stock", "inventory", "fulfil", "available", "units", "restock"]):
         return "inventory_check"
-    if any(w in text for w in ["quote", "discount", "price", "pricing"]):
+    if any(w in text for w in ["quote", "discount", "price", "pricing", "order"]):
         return "create_quote"
     if any(w in text for w in ["invoice", "payment", "overdue", "paid", "bill"]):
         return "invoice_status"

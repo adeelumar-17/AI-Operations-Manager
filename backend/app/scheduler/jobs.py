@@ -1,66 +1,40 @@
-'''
-This module defines the background job worker routines executed periodically by APScheduler. It processes due follow-up tasks by synthesizing context-aware agent prompts, invoking the operations agent to execute the follow-ups, and recording completion or failure results.
-Classes:
-    None (Background job execution module).
-Methods:
-    process_due_followups: Queries due follow-up tasks from the database and runs the agent to execute automated collections reminders and quote follow-ups.
-'''
-
+"""Claim due tasks once and verify follow-up records before completion."""
 import logging
-from datetime import datetime, timezone
-from typing import Optional
-
 from backend.app.db.database import SessionLocal
 from backend.app.db.repositories.followup_repository import FollowupRepository
+from backend.app.services.execution_service import require_logged_communication
 from agents.agent_service import run_agent
 
 logger = logging.getLogger(__name__)
 
 
 def process_due_followups() -> int:
-    """Check for due follow-up tasks and execute them via the operations agent.
-
-    Returns the number of tasks processed.
-    """
-    logger.info("Running process_due_followups job...")
-    processed_count = 0
-
+    processed = 0
     try:
         with SessionLocal() as db:
-            repo = FollowupRepository(db)
-            due_tasks = repo.get_due_tasks()
-
-            if not due_tasks:
-                logger.debug("No due follow-up tasks found.")
-                return 0
-
-            logger.info(f"Found {len(due_tasks)} due follow-up task(s). Processing...")
-
-            for task in due_tasks:
-                task_id = task.id
-                repo.mark_in_progress(task_id)
-
-                # Formulate synthesized agent prompt
-                customer_info = f"customer {task.customer_id}" if task.customer_id else "customer"
-                quote_info = f"quote {task.quote_id}" if task.quote_id else ""
-                prompt = (
-                    f"Scheduled automated follow-up: Check status and log follow-up communication "
-                    f"for {customer_info} regarding {task.task_type} {quote_info}."
-                )
-
+            task_ids = [task.id for task in FollowupRepository(db).get_due_tasks()]
+        for task_id in task_ids:
+            try:
+                with SessionLocal() as db:
+                    task = FollowupRepository(db).mark_in_progress(task_id)
+                    if task is None:
+                        continue  # another worker already claimed it
+                    customer_id, quote_id, task_type = task.customer_id, task.quote_id, task.task_type
+                prompt = (f'Scheduled follow-up now due: {task_type}. Customer UUID: {customer_id}. '
+                          f'Quote UUID: {quote_id or "none"}. Check the referenced business facts and log an outbound '
+                          'note or email draft. Link the quote UUID when supplied. Do not schedule another task and do not claim email delivery.')
+                result = run_agent(user_input=prompt)
+                with SessionLocal() as db:
+                    require_logged_communication(result, db, customer_id, 'quote' if quote_id else None, quote_id)
+                    FollowupRepository(db).mark_completed(task_id)
+                processed += 1
+            except Exception as exc:
+                logger.exception('Follow-up task %s failed', task_id)
                 try:
-                    res = run_agent(user_input=prompt)
-                    repo.mark_completed(task_id)
-                    processed_count += 1
-                    logger.info(
-                        f"Completed follow-up task {task_id}: {res.get('workflow')} - {res.get('response')[:80]}..."
-                    )
-                except Exception as exc:
-                    error_msg = str(exc)
-                    repo.mark_failed(task_id, error=error_msg)
-                    logger.error(f"Failed executing follow-up task {task_id}: {error_msg}")
-
-    except Exception as exc:
-        logger.warning(f"Database unavailable or error in process_due_followups: {exc}")
-
-    return processed_count
+                    with SessionLocal() as db:
+                        FollowupRepository(db).mark_failed(task_id, str(exc))
+                except Exception:
+                    logger.exception('Could not mark follow-up task %s failed; manual review needed', task_id)
+    except Exception:
+        logger.exception('Due-task sweep failed')
+    return processed

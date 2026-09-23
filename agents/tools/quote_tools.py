@@ -12,11 +12,10 @@ Methods:
     convert_quote_to_order: Tool to convert an approved quote directly into a new customer order.
 '''
 
-import json
-import uuid
+import logging
 from decimal import Decimal
 from typing import Annotated
-from uuid import UUID
+
 
 from langchain_core.tools import tool
 
@@ -24,6 +23,10 @@ from backend.app.db.database import SessionLocal
 from backend.app.db.repositories.order_repository import OrderRepository
 from backend.app.db.repositories.quote_repository import QuoteRepository
 from backend.app.services.quote_service import QuoteService
+from backend.app.services.authorization_service import discount_limit, check_discount_authorization
+from backend.app.services.exceptions import ApprovalRequired, ValidationError
+
+logger = logging.getLogger(__name__)
 
 
 def _make_quote_service() -> tuple[QuoteService, object]:
@@ -45,7 +48,7 @@ def get_quote(
     """
     service, session = _make_quote_service()
     try:
-        quote = service.quote_repository.get_with_items(UUID(quote_id))
+        quote = service.quote_repository.get_with_items(quote_id)
         if quote is None:
             return f"Quote {quote_id} not found."
         lines = [
@@ -64,6 +67,7 @@ def get_quote(
             )
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error retrieving quote: {e}"
     finally:
         session.close()
@@ -73,10 +77,6 @@ def get_quote(
 def apply_discount_to_quote(
     quote_id: Annotated[str, "UUID of the quote"],
     discount_percent: Annotated[float, "Discount percentage (0-100) to apply"],
-    approval_threshold: Annotated[
-        float,
-        "Max discount % allowed without approval (10 for regular, 15 for preferred customers)",
-    ] = 10.0,
 ) -> str:
     """Apply a discount percentage to a quote.
 
@@ -84,17 +84,33 @@ def apply_discount_to_quote(
     the quote status becomes 'pending_approval' — the caller MUST surface this
     to the user and NOT proceed without approval.
 
-    The approval_threshold should match the customer's tier:
-      - Regular customers: 10%
-      - Preferred customers: 15%
+    Customer policy limits are resolved by Python from the stored customer record.
     """
     service, session = _make_quote_service()
     try:
+        existing = service.quote_repository.get_with_items(quote_id)
+        if existing is None:
+            raise ValidationError("Quote not found.")
+        service.require_editable(existing)
+        percent = Decimal(str(discount_percent))
+        if not percent.is_finite() or not Decimal("0") <= percent <= Decimal("25"):
+            raise ValidationError("Discount must be between 0 and 25 percent.")
+        if percent != percent.quantize(Decimal("0.01")):
+            raise ValidationError("Discount must have at most two decimal places.")
+        threshold = discount_limit(existing.customer)
+        decision = check_discount_authorization(percent, threshold)
+        if decision.approval_required:
+            raise ApprovalRequired("quote_discount_approval", {
+                "quote_id": str(existing.id), "discount_percent": str(percent),
+                "previous_status": existing.status,
+                "subtotal": str(existing.subtotal), "total": str(existing.total),
+            }, decision.reason)
         quote = service.apply_discount(
-            quote_id=UUID(quote_id),
-            discount_percent=Decimal(str(discount_percent)),
-            approval_threshold=Decimal(str(approval_threshold)),
+            quote_id=existing.id,
+            discount_percent=percent,
+            approval_threshold=threshold,
         )
+        session.commit()
         approval_note = ""
         if quote.status == "pending_approval":
             approval_note = (
@@ -108,7 +124,12 @@ def apply_discount_to_quote(
             f"  Status: {quote.status}"
             f"{approval_note}"
         )
+    except ApprovalRequired:
+        raise
     except Exception as e:
+        logger.exception('Operation failed')
+        session.rollback()
+        logger.exception("Discount application failed")
         return f"Error applying discount: {e}"
     finally:
         session.close()
@@ -125,7 +146,7 @@ def convert_quote_to_order(
     """
     service, session = _make_quote_service()
     try:
-        order = service.convert_to_order(UUID(quote_id))
+        order = service.convert_to_order(quote_id)
         session.commit()
         return (
             f"✓ Quote converted to order successfully.\n"
@@ -134,6 +155,7 @@ def convert_quote_to_order(
             f"  Total: ${order.total}"
         )
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error converting quote to order: {e}"
     finally:
         session.close()

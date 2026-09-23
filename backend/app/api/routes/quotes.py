@@ -24,6 +24,8 @@ def list_quotes(
     current_user: dict = Depends(get_current_user),
 ):
     """List all quotations, optionally filtered by status."""
+    if status and status not in {"all", "draft", "pending_approval", "approved", "rejected", "converted", "expired"}:
+        raise HTTPException(status_code=422, detail="Invalid quote status.")
     repo = QuoteRepository(db)
     quotes = repo.list_all(status=status)
     return [
@@ -69,6 +71,9 @@ def get_quote(
         "id": str(quote.id),
         "quote_number": quote.quote_number,
         "customer_id": str(quote.customer_id),
+        "customer_name": quote.customer.name if quote.customer else None,
+        "approval_id": str(quote.approval_id) if quote.approval_id else None,
+        "created_at": quote.created_at.isoformat() if quote.created_at else None,
         "status": quote.status,
         "subtotal": float(quote.subtotal) if quote.subtotal else 0.0,
         "discount_percent": float(quote.discount_percent) if quote.discount_percent else 0.0,

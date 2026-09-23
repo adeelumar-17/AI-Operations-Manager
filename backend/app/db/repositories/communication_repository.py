@@ -26,6 +26,7 @@ class CommunicationRepository:
         communication_type: str | None = None,
         direction: str | None = None,
         status: str | None = None,
+        limit: int | None = None,
     ) -> list[Communication]:
         statement = (
             select(Communication)
@@ -42,6 +43,8 @@ class CommunicationRepository:
             statement = statement.where(Communication.status == status)
 
         statement = statement.order_by(Communication.created_at.desc())
+        if limit is not None:
+            statement = statement.limit(limit)
 
         return list(self.session.scalars(statement).all())
 

@@ -16,7 +16,8 @@ Methods:
 '''
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
+from datetime import datetime, timezone
 from uuid import UUID
 
 from backend.app.db.models.order import Order
@@ -34,11 +35,13 @@ class QuoteLineItem:
     unit_price: Decimal
 
     def __post_init__(self) -> None:
-        if self.quantity <= 0:
+        if isinstance(self.quantity, bool) or not isinstance(self.quantity, int) or self.quantity <= 0:
             raise ValueError("Quantity must be greater than zero.")
 
-        if self.unit_price < Decimal("0"):
+        if not self.unit_price.is_finite() or self.unit_price < Decimal("0"):
             raise ValueError("Unit price cannot be negative.")
+        if self.unit_price != self.unit_price.quantize(Decimal("0.01")):
+            raise ValueError("Unit price must have at most two decimal places.")
 
     @property
     def line_total(self) -> Decimal:
@@ -58,15 +61,15 @@ def calculate_discount_amount(
     subtotal: Decimal,
     discount_percent: Decimal,
 ) -> Decimal:
-    if subtotal < Decimal("0"):
+    if not subtotal.is_finite() or subtotal < Decimal("0"):
         raise ValueError("Subtotal cannot be negative.")
 
-    if not Decimal("0") <= discount_percent <= Decimal("100"):
+    if not discount_percent.is_finite() or not Decimal("0") <= discount_percent <= Decimal("100"):
         raise ValueError(
             "Discount percentage must be between 0 and 100."
         )
 
-    return subtotal * discount_percent / Decimal("100")
+    return (subtotal * discount_percent / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
 def calculate_quote_total(
@@ -90,6 +93,14 @@ class QuoteService:
         self.quote_repository = quote_repository
         self.order_repository = order_repository
 
+    @staticmethod
+    def require_editable(quote):
+        if quote.status in {"converted", "expired", "rejected", "pending_approval"}:
+            raise ValidationError(f"Cannot edit a {quote.status} quote.")
+        expires = getattr(quote, "expires_at", None)
+        if expires and expires.replace(tzinfo=expires.tzinfo or timezone.utc) <= datetime.now(timezone.utc):
+            raise ValidationError("Quote has expired.")
+
     def add_line_item(
         self,
         quote_id: UUID,
@@ -103,6 +114,8 @@ class QuoteService:
             raise NotFoundError(f"Quote {quote_id} was not found.")
 
         line_item = QuoteLineItem(quantity, unit_price)
+        self.require_editable(quote)
+        quote.status = "draft"
         quote_item = QuoteItem(
             quote_id=quote.id,
             product_id=product_id,
@@ -138,6 +151,8 @@ class QuoteService:
             raise NotFoundError(f"Quote item {item_id} was not found.")
 
         line_item = QuoteLineItem(quantity, unit_price)
+        self.require_editable(quote)
+        quote.status = "draft"
         quote_item.quantity = line_item.quantity
         quote_item.unit_price = line_item.unit_price
         quote_item.line_total = line_item.line_total
@@ -165,6 +180,8 @@ class QuoteService:
         if quote_item is None:
             raise NotFoundError(f"Quote item {item_id} was not found.")
 
+        self.require_editable(quote)
+        quote.status = "draft"
         self.quote_repository.delete_item(quote_item)
         quote.items.remove(quote_item)
         self.recalculate_quote(quote)
@@ -206,10 +223,13 @@ class QuoteService:
         if quote is None:
             raise NotFoundError(f"Quote {quote_id} was not found.")
 
-        if not Decimal("0") <= discount_percent <= Decimal("100"):
+        self.require_editable(quote)
+        if not discount_percent.is_finite() or not Decimal("0") <= discount_percent <= Decimal("25"):
             raise ValidationError(
-                "Discount percentage must be between 0 and 100."
+                "Discount percentage must be between 0 and 25 under OfficeHub policy."
             )
+        if discount_percent != discount_percent.quantize(Decimal("0.01")):
+            raise ValidationError("Discount must have at most two decimal places.")
 
         authorization = check_discount_authorization(
             discount_percent=discount_percent,
@@ -221,6 +241,10 @@ class QuoteService:
 
         if authorization.approval_required:
             quote.status = "pending_approval"
+            quote = self.quote_repository.save(quote)
+        else:
+            quote.status = "approved"
+            quote.approval_id = None
             quote = self.quote_repository.save(quote)
 
         return quote
@@ -238,6 +262,10 @@ class QuoteService:
             raise ValidationError(
                 "Only approved quotes can be converted to orders."
             )
+        self.require_editable(quote)
+
+        if not quote.items:
+            raise ValidationError("Cannot convert an empty quote.")
 
         order = self.order_repository.create_from_quote(quote)
         quote.status = "converted"

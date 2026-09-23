@@ -113,6 +113,7 @@ class CommunicationService:
         communication_type: str | None = None,
         direction: str | None = None,
         status: str | None = None,
+        limit: int | None = None,
     ) -> list[Communication]:
         self._require_customer(customer_id)
 
@@ -125,6 +126,12 @@ class CommunicationService:
         if status is not None and status not in STATUSES:
             raise ValidationError("Invalid communication status.")
 
+        if limit is not None:
+            if not 1 <= limit <= 100:
+                raise ValidationError("History limit must be between 1 and 100.")
+            return self.communication_repository.list_by_customer(
+                customer_id=customer_id, communication_type=communication_type,
+                direction=direction, status=status, limit=limit)
         return self.communication_repository.list_by_customer(
             customer_id=customer_id,
             communication_type=communication_type,
@@ -152,4 +159,3 @@ class CommunicationService:
 
         if direction not in DIRECTIONS:
             raise ValidationError("Invalid communication direction.")
-

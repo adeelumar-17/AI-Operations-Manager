@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 '''
 what the file does?
 This module provides LangChain-compatible order management tools for the operations agent, delegating to OrderService to retrieve order status, advance fulfillment lifecycle states, and execute order fulfillment.
@@ -13,7 +15,7 @@ Methods:
 '''
 
 from typing import Annotated
-from uuid import UUID
+
 
 from langchain_core.tools import tool
 
@@ -49,7 +51,7 @@ def get_order_status(
     """
     service, session = _make_order_service()
     try:
-        order = service.get_order(UUID(order_id))
+        order = service.get_order(order_id)
         lines = [
             f"Order: {order.order_number}",
             f"  Status: {order.status}",
@@ -67,6 +69,7 @@ def get_order_status(
             )
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error retrieving order: {e}"
     finally:
         session.close()
@@ -87,12 +90,13 @@ def update_order_status(
     """
     service, session = _make_order_service()
     try:
-        order = service.transition_status(UUID(order_id), new_status)
+        order = service.transition_status(order_id, new_status)
         session.commit()
         return (
             f"✓ Order {order.order_number} status updated to '{order.status}'."
         )
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error updating order status: {e}"
     finally:
         session.close()
@@ -109,13 +113,14 @@ def fulfill_order(
     """
     service, session = _make_order_service()
     try:
-        order = service.fulfill_order(UUID(order_id))
+        order = service.fulfill_order(order_id)
         session.commit()
         return (
             f"✓ Order {order.order_number} fulfilled. Status: {order.status}. "
             f"Inventory has been updated."
         )
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error fulfilling order: {e}"
     finally:
         session.close()

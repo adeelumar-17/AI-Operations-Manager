@@ -13,7 +13,10 @@ Methods:
 import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
+from inspect import signature
+from langchain_core.runnables import RunnableConfig
+from langgraph.errors import GraphInterrupt
 
 from backend.app.db.database import SessionLocal
 from backend.app.db.models.audit_log import AuditLog
@@ -69,16 +72,18 @@ def record_audit_log(
             db.commit()
             return log_entry.id
     except Exception as exc:
-        logger.debug(f"Audit log recording skipped (DB unavailable or error): {exc}")
+        logger.exception("Audit log recording failed")
         return None
 
 
 def audit_node(node_name: str):
     """Decorator for wrapping LangGraph nodes to automatically capture audit logs."""
     def decorator(fn: Callable):
-        def wrapper(state: dict, *args, **kwargs) -> dict:
-            run_id = state.get("request_id")
-            conv_id = state.get("conversation_id")
+        def wrapper(state: dict, config: RunnableConfig) -> dict:
+            request_id = state.get("request_id")
+            run_id = uuid5(NAMESPACE_URL, "officehub:run:" + request_id) if request_id else None
+            # Conversation IDs are checkpoint keys and need not reference an ORM conversation.
+            conv_id = None
             input_summary = {
                 "workflow": state.get("workflow"),
                 "intent": state.get("intent"),
@@ -86,7 +91,7 @@ def audit_node(node_name: str):
             }
 
             try:
-                result = fn(state, *args, **kwargs)
+                result = fn(state, config) if "config" in signature(fn).parameters else fn(state)
                 record_audit_log(
                     node=node_name,
                     action=state.get("workflow") or node_name,
@@ -103,6 +108,10 @@ def audit_node(node_name: str):
                     conversation_id=conv_id,
                 )
                 return result
+            except GraphInterrupt:
+                record_audit_log(node=node_name, run_id=run_id, action="waiting_approval",
+                                 approval_status="pending", input_data=input_summary)
+                raise
             except Exception as exc:
                 record_audit_log(
                     node=node_name,
@@ -112,6 +121,6 @@ def audit_node(node_name: str):
                     run_id=run_id,
                     conversation_id=conv_id,
                 )
-                raise exc
+                raise
         return wrapper
     return decorator

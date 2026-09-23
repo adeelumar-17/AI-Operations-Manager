@@ -40,8 +40,10 @@ from agents.tools.communication_tools import (
     get_communication_history,
 )
 from agents.tools.policy_tools import search_business_policy
+from agents.tools.followup_tools import create_followup_task
 
 ALL_TOOLS = [
+    create_followup_task,
     # Customer management
     search_customer,
     get_customer_details,

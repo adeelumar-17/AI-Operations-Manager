@@ -8,7 +8,7 @@ Methods:
     trigger_due_tasks: POST endpoint that manually triggers the execution of all currently due background follow-up tasks.
 '''
 
-from uuid import UUID
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,8 @@ from backend.app.api.dependencies import get_db, get_current_user
 from backend.app.schemas.task import CreateTaskRequest, TaskResponse
 from backend.app.db.repositories.followup_repository import FollowupRepository
 from backend.app.scheduler.jobs import process_due_followups
+from backend.app.services.followup_service import create_followup
+from backend.app.services.exceptions import ValidationError, NotFoundError
 
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
 
@@ -55,31 +57,12 @@ def create_task(
     current_user: dict = Depends(get_current_user),
 ):
     """Create a new follow-up task scheduled for a future time."""
-    repo = FollowupRepository(db)
-
-    cust_id = None
-    if req.customer_id:
-        try:
-            cust_id = UUID(str(req.customer_id))
-        except ValueError:
-            from backend.app.db.models.customer import Customer
-            first_c = db.query(Customer).first()
-            if first_c:
-                cust_id = first_c.id
-
-    quote_id = None
-    if req.quote_id:
-        try:
-            quote_id = UUID(str(req.quote_id))
-        except ValueError:
-            pass
-
-    task = repo.create(
-        task_type=req.task_type,
-        scheduled_at=req.scheduled_at,
-        customer_id=cust_id,
-        quote_id=quote_id,
-    )
+    try:
+        task = create_followup(db, req.task_type, req.scheduled_at, req.customer_id, req.quote_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return TaskResponse(
         id=task.id,
         task_type=task.task_type,

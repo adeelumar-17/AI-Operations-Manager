@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 '''
 what the file does?
 This module provides LangChain-compatible customer management tools for the operations agent, wrapping CustomerService to search customer records, retrieve detailed profile info, and pull unified historical interactions (orders, invoices, and communications).
@@ -17,7 +19,7 @@ from uuid import UUID
 
 from langchain_core.tools import tool
 
-from backend.app.core.config import settings
+
 from backend.app.db.database import SessionLocal
 from backend.app.db.repositories.customer_repository import CustomerRepository
 from backend.app.db.repositories.order_repository import OrderRepository
@@ -59,6 +61,7 @@ def search_customer(
             )
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error searching for customer: {e}"
     finally:
         session.close()
@@ -86,6 +89,7 @@ def get_customer_details(
             f"  Created: {customer.created_at.date()}"
         )
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error retrieving customer: {e}"
     finally:
         session.close()
@@ -109,10 +113,10 @@ def get_customer_history(
         lines = [f"Customer history for ID {customer_id}:"]
         lines.append(f"\nOrders ({len(orders)}):")
         for o in orders:
-            lines.append(f"  - {o.order_number} | Status: {o.status} | Total: ${o.total}")
+            lines.append(f"  - {o.order_number} | UUID: {o.id} | Status: {o.status} | Total: ${o.total}")
         lines.append(f"\nInvoices ({len(invoices)}):")
         for inv in invoices:
-            lines.append(f"  - {inv.invoice_id} | Status: {inv.status} | Amount: ${inv.amount} | Due: {inv.due_date}")
+            lines.append(f"  - {inv.invoice_id} | UUID: {inv.id} | Status: {inv.status} | Amount: ${inv.amount} | Due: {inv.due_date}")
         lines.append(f"\nCommunications ({len(comms)}):")
         for comm in comms[:5]:  # bounded — don't dump the entire history
             lines.append(f"  - [{comm.type}] {comm.subject or '(no subject)'} | Status: {comm.status}")
@@ -120,6 +124,7 @@ def get_customer_history(
             lines.append(f"  ... and {len(comms) - 5} more")
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error retrieving customer history: {e}"
     finally:
         session.close()

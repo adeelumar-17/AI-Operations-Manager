@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 '''
 what the file does?
 This module provides LangChain-compatible inventory tools for the operations agent, wrapping InventoryService to allow checking stock levels, updating inventory balances, validating order fulfillment feasibility, and listing low-stock products.
@@ -56,6 +58,8 @@ def _find_product(repo: ProductRepository, identifier: str):
 
     # 3. Try search by name or SKU
     matches = repo.search_by_name_or_sku(val_str)
+    if len(matches) > 1:
+        raise ValueError("Ambiguous product name. Specify one SKU: " + ", ".join(p.sku for p in matches))
     if matches:
         return matches[0]
 
@@ -105,6 +109,7 @@ def check_stock(
                 f"Shortage: {result.shortage_quantity}"
             )
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error checking stock: {e}"
     finally:
         session.close()
@@ -131,20 +136,21 @@ def update_inventory(
         if normalized_reason not in valid_reasons:
             normalized_reason = "restock" if change_quantity > 0 else "manual_adjustment"
 
-        old_quantity = product.stock_quantity
-        service.update_inventory(
+        change = service.update_inventory(
             product_id=product.id,
             change_quantity=change_quantity,
             reason=normalized_reason,
         )
         session.commit()
-        new_quantity = old_quantity + change_quantity
+        new_quantity = change.resulting_balance
+        old_quantity = new_quantity - change_quantity
         action_verb = "Added" if change_quantity > 0 else "Deducted"
         return (
             f"✓ Successfully {action_verb.lower()} {abs(change_quantity)} units for '{product.name}' (SKU: {product.sku}).\n"
             f"  Previous stock: {old_quantity} | New stock: {new_quantity} | Reason: {normalized_reason}"
         )
     except Exception as e:
+        logger.exception('Operation failed')
         session.rollback()
         return f"Error updating inventory: {e}"
     finally:
@@ -166,16 +172,24 @@ def check_fulfillment_feasibility(
     service, session = _make_inventory_service()
     try:
         item_list = json.loads(items)
+        if not isinstance(item_list, list) or not item_list:
+            raise ValueError("Provide a nonempty list of product quantities.")
         lines = ["Fulfillment feasibility check:"]
         all_feasible = True
+        demands = {}
         for item in item_list:
             raw_id = item.get("product_id") or item.get("sku") or item.get("product")
-            qty = int(item.get("quantity", 0))
+            qty = item.get("quantity", 0)
+            if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
+                raise ValueError("Quantities must be positive whole numbers.")
             product = _find_product(service.product_repository, raw_id)
             if product is None:
                 lines.append(f"  ✗ Product '{raw_id}': NOT FOUND")
                 all_feasible = False
                 continue
+            previous = demands.get(product.id, (product, 0))[1]
+            demands[product.id] = (product, previous + qty)
+        for product, qty in demands.values():
             from backend.app.services.inventory_service import check_fulfillment_feasibility as cff
             result = cff(available_quantity=product.stock_quantity, requested_quantity=qty)
             if result.feasible:
@@ -189,6 +203,7 @@ def check_fulfillment_feasibility(
         lines.append(f"\nOverall: {'FEASIBLE ✓' if all_feasible else 'NOT FEASIBLE ✗'}")
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error checking fulfillment feasibility: {e}"
     finally:
         session.close()
@@ -214,6 +229,7 @@ def get_low_stock_products() -> str:
             )
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error retrieving low-stock list: {e}"
     finally:
         session.close()
@@ -239,6 +255,7 @@ def get_all_products() -> str:
             )
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error retrieving product catalog: {e}"
     finally:
         session.close()

@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 '''
 what the file does?
 This module provides a LangChain-compatible RAG policy search tool for the operations agent, querying embedded business policy documents and procedures to guide operational decisions (discounts, refunds, approval rules).
@@ -13,8 +15,9 @@ from typing import Annotated
 
 from langchain_core.tools import tool
 
-from backend.app.core.config import settings
-from rag.retriever import retrieve
+
+from rag.retriever import retrieve_with_session
+from backend.app.db.database import SessionLocal
 
 
 @tool
@@ -38,10 +41,13 @@ def search_business_policy(
       - "Does this refund require approval?"
       - "What is the standard payment term?"
     """
-    db_url = settings.DATABASE_URL
+
 
     try:
-        results = retrieve(query, db_url, top_k=top_k)
+        if not 1 <= top_k <= 20:
+            raise ValueError("top_k must be between 1 and 20.")
+        with SessionLocal() as session:
+            results = retrieve_with_session(query, session, top_k=top_k)
         if not results:
             return "No relevant policy found for that query."
 
@@ -53,4 +59,5 @@ def search_business_policy(
 
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error searching policy database: {e}"

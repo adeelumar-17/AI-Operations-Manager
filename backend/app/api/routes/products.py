@@ -7,13 +7,13 @@ Methods:
     get_low_stock_products: GET endpoint to query products whose current stock is at or below their reorder point.
 '''
 
-from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException
+
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from backend.app.api.dependencies import get_db, get_current_user
 from backend.app.db.repositories.product_repository import ProductRepository
-from backend.app.db.repositories.inventory_repository import InventoryRepository
+
 
 router = APIRouter(prefix="/products", tags=["Products & Inventory"])
 
@@ -26,7 +26,7 @@ def list_products(
     """List all products with stock information."""
     prod_repo = ProductRepository(db)
 
-    products = prod_repo.list_all() if hasattr(prod_repo, "list_all") else []
+    products = prod_repo.list_all()
     results = []
     for p in products:
         results.append({
@@ -51,7 +51,7 @@ def get_low_stock_products(
 ):
     """List products that are at or below their reorder point."""
     prod_repo = ProductRepository(db)
-    low_stock = prod_repo.list_low_stock() if hasattr(prod_repo, "list_low_stock") else []
+    low_stock = prod_repo.list_low_stock()
     return [
         {
             "product_id": str(p.id),

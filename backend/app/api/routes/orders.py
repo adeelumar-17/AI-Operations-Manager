@@ -39,6 +39,8 @@ def list_orders(
     current_user: dict = Depends(get_current_user),
 ):
     """List all orders, optionally filtered by status."""
+    if status and status not in {"all", "pending", "processing", "shipped", "delivered", "cancelled"}:
+        raise HTTPException(status_code=422, detail="Invalid order status.")
     stmt = select(Order).options(joinedload(Order.customer)).order_by(Order.created_at.desc())
     if status and status != "all":
         stmt = stmt.where(Order.status == status)

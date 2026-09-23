@@ -12,7 +12,7 @@ Methods:
 '''
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 
 from backend.app.db.models.product import Product
@@ -23,11 +23,13 @@ class ProductRepository:
         self.session = session
 
     def get_by_id(self, product_id: UUID) -> Product | None:
-        return self.session.get(Product, product_id)
+        # Refresh any previously loaded instance after acquiring the stock lock.
+        return self.session.scalars(select(Product).where(Product.id == product_id)
+                                    .with_for_update().execution_options(populate_existing=True)).one_or_none()
 
     def get_by_sku(self, sku: str) -> Product | None:
-        statement = select(Product).where(Product.sku.ilike(sku.strip()))
-        return self.session.scalars(statement).first()
+        statement = select(Product).where(func.lower(Product.sku) == sku.strip().lower())
+        return self.session.scalars(statement).one_or_none()
 
     def search_by_name_or_sku(self, query: str) -> list[Product]:
         from sqlalchemy import or_, and_

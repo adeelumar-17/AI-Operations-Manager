@@ -9,6 +9,7 @@ Methods:
 
 from dataclasses import dataclass
 from decimal import Decimal
+import re
 
 
 @dataclass(frozen=True)
@@ -21,6 +22,8 @@ def check_discount_authorization(
     discount_percent: Decimal,
     approval_threshold: Decimal,
 ) -> AuthorizationResult:
+    if not discount_percent.is_finite() or not approval_threshold.is_finite():
+        raise ValueError("Discount and threshold must be finite.")
     if discount_percent < Decimal("0"):
         raise ValueError("Discount percentage cannot be negative.")
 
@@ -46,6 +49,8 @@ def check_refund_authorization(
     refund_amount: Decimal,
     approval_threshold: Decimal,
 ) -> AuthorizationResult:
+    if not refund_amount.is_finite() or not approval_threshold.is_finite():
+        raise ValueError("Refund and threshold must be finite.")
     if refund_amount < Decimal("0"):
         raise ValueError("Refund amount cannot be negative.")
 
@@ -62,3 +67,13 @@ def check_refund_authorization(
         )
 
     return AuthorizationResult(approval_required=False)
+
+
+def customer_tier(customer) -> str:
+    """Read the explicit legacy tier marker, never infer a tier with an LLM."""
+    notes = getattr(customer, "notes", None) or ""
+    return "preferred" if re.match(r"^\s*Preferred customer tier\b", notes, re.I) else "regular"
+
+
+def discount_limit(customer) -> Decimal:
+    return Decimal("15") if customer_tier(customer) == "preferred" else Decimal("10")

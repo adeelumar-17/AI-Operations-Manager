@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 '''
 what the file does?
 This module implements the formulate_response graph node, synthesizing tool outputs, execution errors, or pending approval requests into a clear, professional natural-language reply for the user.
@@ -9,11 +11,11 @@ Methods:
     formulate_response: Graph node synthesizing tool results or approval gates into the final natural language response.
 '''
 
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage
+
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from agents.graph.state import AgentState
-from agents.prompts.prompts import RESPONSE_PROMPT
+from agents.prompts.prompts import RESPONSE_PROMPT, SYSTEM_PROMPT
 from agents.llm import get_llm
 
 
@@ -28,10 +30,14 @@ def formulate_response(state: AgentState) -> dict:
     approval_required = state.get("approval_required", False)
     action_results = state.get("action_results", [])
     workflow = state.get("workflow", "unknown")
+    failed = [r for r in action_results if str(r.get("result", "")).startswith("Error")]
+    if failed:
+        error = error or "; ".join(str(r["result"]) for r in failed)
 
     # --- Error path ---
-    if error and not action_results:
+    if error:
         return {
+            "error": error,
             "response": (
                 f"I encountered an issue processing your request: {error}\n"
                 "Please check the details and try again, or contact support if the problem persists."
@@ -63,7 +69,7 @@ def formulate_response(state: AgentState) -> dict:
             return {
                 "response": (
                     "✅ **Manager Approval Granted**\n\n"
-                    f"The operation has been approved and completed.\n{results_text}"
+                    f"The manager decision was recorded.\n{results_text}"
                 )
             }
         else:
@@ -82,14 +88,15 @@ def formulate_response(state: AgentState) -> dict:
             action_results=results_text or "No actions were taken.",
             approval_required=approval_required,
         )
-        response = llm.invoke([HumanMessage(content=prompt)])
+        response = llm.invoke([SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content="Original request: " + state["user_input"] + "\n" + prompt)])
         return {"response": response.content.strip()}
 
     except Exception as e:
+        logger.exception('Operation failed')
         # Fallback: just return the raw results
         return {
             "response": (
-                f"Request completed ({workflow}).\n"
+                f"Recorded results ({workflow}); response generation was unavailable.\n"
                 f"Results:{results_text}"
             )
         }

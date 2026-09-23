@@ -115,7 +115,7 @@ def test_approved_quote_converts_to_order():
         discount_percent=Decimal("0"),
         discount_amount=Decimal("0.00"),
         total=Decimal("200.00"),
-        items=[],
+        items=[SimpleNamespace(quantity=1, unit_price=Decimal("200.00"), line_total=Decimal("200.00"))],
     )
 
     expected_order = object()

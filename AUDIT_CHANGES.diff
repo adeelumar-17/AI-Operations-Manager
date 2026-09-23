@@ -1,0 +1,4176 @@
+diff --git a/agents/agent_service.py b/agents/agent_service.py
+index 52a8eb7..e4e33bc 100644
+--- a/agents/agent_service.py
++++ b/agents/agent_service.py
+@@ -1,176 +1,165 @@
+-'''
+-This module defines the AgentService interface, serving as the single decoupled entry point for invoking and resuming the LangGraph operations agent. It is called by both FastAPI HTTP endpoints and APScheduler background jobs.
+-Classes:
+-    None (Agent facade and execution service module).
+-Methods:
+-    run_agent: Executes a single user operational prompt through the compiled LangGraph StateGraph, managing thread checkpoints and detecting policy interruptions.
+-    resume_agent: Resumes an interrupted workflow from a durable checkpoint when a manager approves or rejects an intercepted action.
+-'''
+-
+-import uuid
+-from typing import Any, Optional
+-
++"""Agent invocation, serialized approval resumption, and execution telemetry."""
++import logging
++from contextlib import contextmanager
++from datetime import datetime, timezone
++from hashlib import sha256
++from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
++from sqlalchemy import text, create_engine
++from sqlalchemy.pool import NullPool
+ from langgraph.types import Command
+-
++from langchain_core.messages import HumanMessage, AIMessage
+ from agents.graph.graph import agent_graph
+-from agents.graph.state import AgentState
+-
+-
+-def run_agent(
+-    user_input: str,
+-    conversation_id: str | None = None,
+-    request_id: str | None = None,
+-    conversation_history: list[dict] | None = None,
+-    thread_id: str | None = None,
+-) -> dict[str, Any]:
+-    """Invoke the operations agent for a single user request.
+-
+-    Args:
+-        user_input: The raw user message.
+-        conversation_id: Optional — links this run to an ongoing conversation.
+-        request_id: Optional — unique ID for this run; auto-generated if absent.
+-        conversation_history: Optional — bounded list of prior messages to include as context.
+-        thread_id: Optional — persistence thread ID for LangGraph checkpointer. Defaults to conversation_id or request_id.
+-
+-    Returns:
+-        A dict with at minimum:
+-          - "request_id": str
+-          - "thread_id": str
+-          - "response": the agent's natural-language response
+-          - "workflow": which workflow was selected
+-          - "intent": the detected intent
+-          - "approval_required": bool
+-          - "approval_id": str | None
+-          - "approval_decision": str | None
+-          - "error": str | None
+-    """
+-    req_id = request_id or str(uuid.uuid4())
+-    active_thread = thread_id or conversation_id or req_id
+-
+-    initial_state: AgentState = {
+-        "request_id": req_id,
+-        "user_input": user_input,
+-        "conversation_id": conversation_id,
+-        "intent": None,
+-        "workflow": None,
+-        "entities": {},
+-        "action_plan": [],
+-        "action_results": [],
+-        "approval_required": False,
+-        "approval_id": None,
+-        "approval_decision": None,
+-        "response": None,
+-        "error": None,
+-        "messages": conversation_history or [],
+-    }
+-
+-    config = {"configurable": {"thread_id": active_thread}}
+-    final_state = agent_graph.invoke(initial_state, config=config)
+-
+-    # Check for LangGraph interrupt
+-    interrupt_info = None
+-    if "__interrupt__" in final_state and final_state["__interrupt__"]:
+-        interrupt_info = final_state["__interrupt__"][0].value
+-
+-    approval_required = final_state.get("approval_required", False) or bool(interrupt_info)
+-    approval_id = final_state.get("approval_id")
+-
+-    if interrupt_info and isinstance(interrupt_info, dict):
+-        approval_id = interrupt_info.get("approval_id") or approval_id
+-
+-    response_text = final_state.get("response")
+-    if not response_text:
+-        if approval_required:
+-            response_text = (
+-                "Action requires managerial approval before proceeding. "
+-                f"Approval Request ID: {approval_id or 'pending'}. "
+-                "The operation is safely paused and will resume once reviewed."
+-            )
+-        else:
+-            response_text = "No response generated."
+-
+-    return {
+-        "request_id": final_state.get("request_id", req_id),
+-        "thread_id": active_thread,
+-        "response": response_text,
+-        "workflow": final_state.get("workflow"),
+-        "intent": final_state.get("intent"),
+-        "entities": final_state.get("entities", {}),
+-        "action_results": final_state.get("action_results", []),
+-        "approval_required": approval_required,
+-        "approval_id": approval_id,
+-        "approval_decision": final_state.get("approval_decision"),
+-        "error": final_state.get("error"),
+-    }
+-
+-
+-def resume_agent(
+-    approval_id: str,
+-    approved: bool,
+-    thread_id: Optional[str] = None,
+-    comment: str = "",
+-    reviewer_id: Optional[str] = None,
+-) -> dict[str, Any]:
+-    """Resume an interrupted agent workflow with a managerial approval decision.
+-
+-    Args:
+-        approval_id: The ID of the pending approval request.
+-        approved: True to approve the action; False to reject.
+-        thread_id: Optional thread ID. If absent, retrieved from the DB approval record.
+-        comment: Optional reviewer comment.
+-        reviewer_id: Optional user ID of the reviewer.
+-
+-    Returns:
+-        The updated agent run result after continuing from the checkpoint.
+-    """
+-    resolved_thread = thread_id
+-
+-    # Sync with DB approval_requests table if DB is accessible
++from backend.app.db.database import SessionLocal, engine
++from backend.app.db.models.agent_run import AgentRun
++from backend.app.db.models.audit_log import AuditLog
++from backend.app.db.models.approval_request import ApprovalRequest
++from backend.app.services.approval_service import ApprovalService
++
++logger = logging.getLogger(__name__)
++_lock_engine = create_engine(engine.url, poolclass=NullPool, pool_pre_ping=True)
++
++
++@contextmanager
++def _thread_lock(thread_id):
++    # Transaction-scoped advisory lock is released even if invocation raises.
++    # It serializes only this checkpoint thread, not unrelated agent requests.
++    key = int.from_bytes(sha256(thread_id.encode()).digest()[:8], 'big', signed=True)
++    # A dedicated connection cannot exhaust the normal tool-session pool while
++    # waiting on an LLM. NullPool closes it as soon as this invocation ends.
++    with _lock_engine.begin() as conn:
++        if not conn.scalar(text('SELECT pg_try_advisory_xact_lock(:key)'), {'key': key}):
++            raise ValueError('This conversation is already being processed; retry shortly.')
++        yield
++
++
++def _result(state, thread_id, request_id=None):
++    interruptions = state.get('__interrupt__') or []
++    pending = interruptions[0].value if interruptions else {}
++    approval_id = pending.get('approval_id') or state.get('approval_id')
++    required = bool(pending) or state.get('approval_required', False)
++    return {'request_id': state.get('request_id', request_id), 'thread_id': thread_id,
++            'response': state.get('response') or ('Manager approval required; the operation is paused.' if pending else 'No response generated.'),
++            'workflow': state.get('workflow'), 'intent': state.get('intent'),
++            'entities': state.get('entities', {}), 'action_results': state.get('action_results', []),
++            'approval_required': required, 'approval_id': approval_id,
++            'approval_decision': state.get('approval_decision'), 'error': state.get('error')}
++
++
++def _record_run(result, user_input=''):
+     try:
+-        from backend.app.db.database import SessionLocal
+-        from backend.app.services.approval_service import ApprovalService
++        request_id = result['request_id']
++        run_id = uuid5(NAMESPACE_URL, 'officehub:run:' + request_id)
+         with SessionLocal() as db:
+-            service = ApprovalService(db)
+-            if approved:
+-                rec = service.approve(approval_id, approved_by=reviewer_id)
+-            else:
+-                rec = service.reject(approval_id, approved_by=reviewer_id)
+-
+-            if rec and not resolved_thread and rec.action_payload:
+-                resolved_thread = rec.action_payload.get("thread_id")
++            run = db.get(AgentRun, run_id)
++            if run is None:
++                run = AgentRun(id=run_id, request_id=request_id, started_at=datetime.now(timezone.utc))
++                db.add(run)
++            run.intent = result.get('intent')
++            run.error = result.get('error')
++            run.status = ('failed' if run.error else 'waiting_approval' if result.get('approval_required') and not result.get('approval_decision') else 'completed')
++            run.completed_at = None if run.status == 'waiting_approval' else datetime.now(timezone.utc)
++            db.flush()
++            for action in result.get('action_results') or [{'tool': None, 'result': result['response']}]:
++                db.add(AuditLog(id=uuid4(), run_id=run_id, node=result.get('workflow') or 'agent',
++                                tool=action.get('tool'), input={'user_input': user_input, 'args': action.get('args', {})},
++                                output={'result': str(action.get('result', ''))}, error=run.error,
++                                approval_status=result.get('approval_decision'), timestamp=datetime.now(timezone.utc)))
++            if result.get('approval_id'):
++                approval = db.get(ApprovalRequest, UUID(result['approval_id']))
++                if approval:
++                    approval.run_id = run_id
++            db.commit()
+     except Exception:
+-        pass
+-
+-    if not resolved_thread:
+-        # Fallback to approval_id itself if thread not found
+-        resolved_thread = approval_id
+-
+-    config = {"configurable": {"thread_id": resolved_thread}}
+-    resume_payload = {
+-        "approved": approved,
+-        "comment": comment,
+-        "reviewer_id": reviewer_id,
+-        "approval_id": approval_id,
+-    }
++        logger.exception('Failed to persist agent telemetry')
+ 
+-    # Resume graph from the checkpoint
+-    final_state = agent_graph.invoke(Command(resume=resume_payload), config=config)
+ 
+-    decision_str = "approved" if approved else "rejected"
+-    response_text = final_state.get("response") or (
+-        f"Operation successfully resumed with decision: {decision_str.upper()}."
+-    )
+-
+-    return {
+-        "request_id": final_state.get("request_id"),
+-        "thread_id": resolved_thread,
+-        "response": response_text,
+-        "workflow": final_state.get("workflow"),
+-        "intent": final_state.get("intent"),
+-        "entities": final_state.get("entities", {}),
+-        "action_results": final_state.get("action_results", []),
+-        "approval_required": True,
+-        "approval_id": approval_id,
+-        "approval_decision": decision_str,
+-        "error": final_state.get("error"),
+-    }
++def _begin_run(request_id):
++    try:
++        with SessionLocal() as db:
++            run_id = uuid5(NAMESPACE_URL, 'officehub:run:' + request_id)
++            if db.get(AgentRun, run_id) is None:
++                db.add(AgentRun(id=run_id, request_id=request_id, status='running', started_at=datetime.now(timezone.utc)))
++                db.commit()
++    except Exception:
++        logger.exception('Failed to record agent start')
++
++
++def run_agent(user_input: str, conversation_id=None, request_id=None, conversation_history=None, thread_id=None) -> dict:
++    request_id = request_id or str(uuid4())
++    thread_id = thread_id or conversation_id or request_id
++    config = {'configurable': {'thread_id': thread_id}}
++    initial = {'request_id': request_id, 'user_input': user_input, 'conversation_id': conversation_id,
++               'intent': None, 'workflow': None, 'entities': {}, 'action_plan': [], 'action_results': [],
++               'approval_required': False, 'approval_id': None, 'approval_decision': None,
++               'response': None, 'error': None, 'messages': (conversation_history or [])[-20:]}
++    with _thread_lock(thread_id):
++        snapshot = agent_graph.get_state(config)
++        if snapshot.next or any(task.error or task.interrupts for task in snapshot.tasks):
++            raise ValueError('This conversation has a pending operation; resolve it before sending another request.')
++        state = initial
++        _begin_run(request_id)
++        try:
++            state = agent_graph.invoke(initial, config=config)
++            result = _result(state, thread_id, request_id)
++        except Exception as exc:
++            logger.exception('Agent invocation failed')
++            result = _result({**initial, 'error': str(exc), 'response': 'The request failed; check the error and retry.'}, thread_id)
++        _record_run(result, user_input)
++        if not state.get('__interrupt__') and not result.get('error'):
++            agent_graph.update_state(config, {'messages': [HumanMessage(content=user_input, id=request_id + ':user'),
++                                                          AIMessage(content=result['response'], id=request_id + ':assistant')]})
++        return result
++
++
++def resume_agent(approval_id: str, approved: bool, thread_id=None, comment='', reviewer_id=None) -> dict:
++    with SessionLocal() as db:
++        record = ApprovalService(db).get_approval(approval_id)
++        if record is None:
++            raise ValueError('Approval not found.')
++        saved_thread = record.action_payload.get('thread_id')
++        if not saved_thread or (thread_id and thread_id != saved_thread):
++            raise ValueError('Approval has no matching checkpoint thread.')
++    with _thread_lock(saved_thread):
++        with SessionLocal() as db:
++            service = ApprovalService(db)
++            record = service.approve(approval_id, reviewer_id) if approved else service.reject(approval_id, reviewer_id)
++            payload = dict(record.action_payload)
++            if payload.get('final_result'):
++                return payload['final_result']
++            payload['review_comment'] = comment
++            record.action_payload = payload
++            db.commit()
++        config = {'configurable': {'thread_id': saved_thread}}
++        snapshot = agent_graph.get_state(config)
++        if not snapshot.next and not any(task.error or task.interrupts for task in snapshot.tasks):
++            # Recover a crash between graph completion and response persistence.
++            if snapshot.values.get('approval_id') != approval_id or not snapshot.values.get('approval_decision'):
++                raise ValueError('No resumable checkpoint matches this approval.')
++            state = snapshot.values
++        else:
++            pending_ids = {i.value.get('approval_id') for task in snapshot.tasks for i in task.interrupts if isinstance(i.value, dict)}
++            if pending_ids and approval_id not in pending_ids:
++                raise ValueError('Checkpoint is waiting for a different approval.')
++            if snapshot.values.get('request_id') != payload['request_id']:
++                raise ValueError('Checkpoint belongs to another request.')
++            command = Command(resume={'approved': approved, 'approval_id': approval_id,
++                                      'reviewer_id': reviewer_id, 'comment': comment}) if pending_ids else None
++            try:
++                state = agent_graph.invoke(command, config=config)
++            except Exception as exc:
++                logger.exception('Approval execution failed; the same decision can be retried')
++                _record_run(_result({**snapshot.values, 'error': str(exc),
++                                     'approval_id': approval_id, 'approval_required': True,
++                                     'approval_decision': 'approved' if approved else 'rejected',
++                                     'response': 'Execution failed; retry the same approval decision.'}, saved_thread))
++                raise
++        result = _result(state, saved_thread)
++        if result.get('error'):
++            # Preserve the decision and surface failure; never claim execution.
++            logger.error('Approved workflow failed: %s', result['error'])
++        with SessionLocal() as db:
++            record = db.get(ApprovalRequest, UUID(approval_id))
++            record.action_payload = {**record.action_payload, 'final_result': result}
++            db.commit()
++        _record_run(result)
++        return result
+diff --git a/agents/graph/graph.py b/agents/graph/graph.py
+index b3451a8..1ee3593 100644
+--- a/agents/graph/graph.py
++++ b/agents/graph/graph.py
+@@ -28,6 +28,7 @@ from agents.graph.nodes.customer_mgmt_node import customer_mgmt_node
+ from agents.graph.nodes.resolve_issue_node import resolve_issue_node
+ from agents.graph.nodes.followup_node import followup_node
+ from agents.graph.nodes.formulate_response import formulate_response
++from backend.app.core.audit import audit_node
+ 
+ 
+ def build_graph(checkpointer=None) -> Any:
+@@ -41,21 +42,21 @@ def build_graph(checkpointer=None) -> Any:
+     graph = StateGraph(AgentState)
+ 
+     # --- Routing nodes (every request passes through all four) ---------------
+-    graph.add_node("parse_request", parse_request)
+-    graph.add_node("classify_intent", classify_intent)
+-    graph.add_node("identify_entities", identify_entities)
+-    graph.add_node("select_workflow", select_workflow)
++    graph.add_node("parse_request", audit_node("parse_request")(parse_request))
++    graph.add_node("classify_intent", audit_node("classify_intent")(classify_intent))
++    graph.add_node("identify_entities", audit_node("identify_entities")(identify_entities))
++    graph.add_node("select_workflow", audit_node("select_workflow")(select_workflow))
+ 
+     # --- Workflow nodes (only one is visited per run) ------------------------
+-    graph.add_node(WORKFLOW_INVENTORY, check_inventory_node)
+-    graph.add_node(WORKFLOW_QUOTE, create_quote_node)
+-    graph.add_node(WORKFLOW_INVOICE, check_invoice_node)
+-    graph.add_node(WORKFLOW_CUSTOMER, customer_mgmt_node)
+-    graph.add_node(WORKFLOW_ISSUE, resolve_issue_node)
+-    graph.add_node(WORKFLOW_FOLLOWUP, followup_node)
++    graph.add_node(WORKFLOW_INVENTORY, audit_node(WORKFLOW_INVENTORY)(check_inventory_node))
++    graph.add_node(WORKFLOW_QUOTE, audit_node(WORKFLOW_QUOTE)(create_quote_node))
++    graph.add_node(WORKFLOW_INVOICE, audit_node(WORKFLOW_INVOICE)(check_invoice_node))
++    graph.add_node(WORKFLOW_CUSTOMER, audit_node(WORKFLOW_CUSTOMER)(customer_mgmt_node))
++    graph.add_node(WORKFLOW_ISSUE, audit_node(WORKFLOW_ISSUE)(resolve_issue_node))
++    graph.add_node(WORKFLOW_FOLLOWUP, audit_node(WORKFLOW_FOLLOWUP)(followup_node))
+ 
+     # --- Response node (every path converges here) ---------------------------
+-    graph.add_node("formulate_response", formulate_response)
++    graph.add_node("formulate_response", audit_node("formulate_response")(formulate_response))
+ 
+     # --- Edges ---------------------------------------------------------------
+     graph.set_entry_point("parse_request")
+diff --git a/agents/graph/nodes/check_inventory_node.py b/agents/graph/nodes/check_inventory_node.py
+index 5816e7c..731ca63 100644
+--- a/agents/graph/nodes/check_inventory_node.py
++++ b/agents/graph/nodes/check_inventory_node.py
+@@ -1,104 +1,41 @@
+-'''
+-what the file does?
+-This module implements the check_inventory_node workflow node, invoking inventory tools via an LLM to check current product stock, adjust inventory levels, check order feasibility, query low stock warnings, and list the full product catalog.
+-
+-Classes:
+-    None (LangGraph workflow node module)
+-
+-Methods:
+-    _get_llm_with_tools: Binds inventory-specific LangChain tools to the LLM.
+-    check_inventory_node: Workflow node that executes inventory queries and updates, returning action results to state.
+-'''
+-
+-from langchain_groq import ChatGroq
+-from langchain_core.messages import SystemMessage, HumanMessage
+-
++"""Inventory queries and adjustments"""
++import logging
++from datetime import datetime, timezone
++from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+ from agents.graph.state import AgentState
+ from agents.tools import ALL_TOOLS
+ from agents.prompts.prompts import SYSTEM_PROMPT
+ from agents.llm import get_llm
+ 
++logger = logging.getLogger(__name__)
+ 
+-def _get_llm_with_tools() -> ChatGroq:
+-    llm = get_llm()
+-    # Only bind inventory-relevant tools for this workflow
+-    inventory_tools = [
+-        t for t in ALL_TOOLS
+-        if t.name in ("check_stock", "update_inventory", "check_fulfillment_feasibility", "get_low_stock_products", "get_all_products", "search_customer")
+-    ]
+-    return llm.bind_tools(inventory_tools)
+-
+-
+-def check_inventory_node(state: AgentState) -> dict:
+-    """Execute the inventory / fulfillment check workflow.
+ 
+-    Calls inventory tools based on the user's request and entities,
+-    then returns the tool results in action_results.
+-    """
+-    user_input = state["user_input"]
+-    entities = state.get("entities", {})
++def _get_tools_for_inventory() -> list:
++    relevant = {"check_stock", "update_inventory", "check_fulfillment_feasibility", "get_low_stock_products", "get_all_products", "search_customer", "get_order_status", "fulfill_order", "update_order_status"}
++    return [t for t in ALL_TOOLS if t.name in relevant]
+ 
+-    # Build context-aware prompt
+-    context_parts = [f"User request: {user_input}"]
+-    if entities.get("product_names"):
+-        context_parts.append(f"Products mentioned: {', '.join(entities['product_names'])}")
+-    if entities.get("quantities"):
+-        context_parts.append(f"Quantities mentioned: {entities['quantities']}")
+-    if entities.get("product_skus"):
+-        context_parts.append(f"SKUs mentioned: {', '.join(entities['product_skus'])}")
+-
+-    context = "\n".join(context_parts)
+-    prompt = (
+-        f"{context}\n\n"
+-        "Handle the user's inventory request:\n"
+-        "- If the user asks to list, see, or show ALL products, or asks about the full catalog "
+-        "(not filtered by low stock), call get_all_products with no arguments.\n"
+-        "- If the user asks how many items/units of a SPECIFIC product are available or checks "
+-        "stock for one item, call check_stock (requested_quantity=0 if just checking current stock). "
+-        "The product_id argument accepts a UUID, an exact SKU, OR a plain product name/partial name — "
+-        "if the user only gave a name (e.g. 'ergonomic chair'), pass that name directly as product_id "
+-        "exactly as the user wrote it. Do not ask the user for a SKU if they have already given a name; "
+-        "the tool will resolve the name itself.\n"
+-        "- If the user asks to add, restock, or adjust stock units, call update_inventory.\n"
+-        "- If checking multiple products for order feasibility, call check_fulfillment_feasibility.\n"
+-        "- If asking specifically about low stock or what needs restocking, call get_low_stock_products."
+-    )
+ 
++def check_inventory_node(state: AgentState) -> dict:
++    results = []
+     try:
+-        llm = _get_llm_with_tools()
+-        messages = [
+-            SystemMessage(content=SYSTEM_PROMPT),
+-            HumanMessage(content=prompt),
+-        ]
+-        response = llm.invoke(messages)
+-
+-        # Execute any tool calls the LLM requested
+-        tool_results = []
+-        if hasattr(response, "tool_calls") and response.tool_calls:
+-            from langchain_core.messages import ToolMessage
+-            for tool_call in response.tool_calls:
+-                tool_fn = next(
+-                    (t for t in ALL_TOOLS if t.name == tool_call["name"]), None
+-                )
+-                if tool_fn:
+-                    result = tool_fn.invoke(tool_call["args"])
+-                    tool_results.append({
+-                        "tool": tool_call["name"],
+-                        "args": tool_call["args"],
+-                        "result": result,
+-                    })
+-
+-        # If no tool calls, treat the LLM's direct response as the result
+-        if not tool_results:
+-            tool_results = [{"tool": "direct_response", "result": response.content}]
+-
+-        return {
+-            "action_plan": [{"action": "check_inventory", "entities": entities}],
+-            "action_results": tool_results,
+-        }
+-
+-    except Exception as e:
+-        return {
+-            "action_results": [],
+-            "error": f"Inventory check failed: {e}",
+-        }
+\ No newline at end of file
++        tools = {t.name: t for t in _get_tools_for_inventory()}
++        llm = get_llm().bind_tools(list(tools.values()))
++        prompt = state['user_input'] + '\nCurrent UTC time: ' + datetime.now(timezone.utc).isoformat() + '\nUse tools for catalog, stock, restocking and fulfillment. Resolve ambiguous products before changing stock. Use multiple tool rounds when a request depends on earlier results. Only perform requested changes.'
++        messages = [SystemMessage(content=SYSTEM_PROMPT), *state.get('messages', [])[-20:], HumanMessage(content=prompt)]
++        for _ in range(6):
++            response = llm.invoke(messages)
++            messages.append(response)
++            if not response.tool_calls:
++                results.append({'tool': 'direct_response', 'result': response.content})
++                break
++            for call in response.tool_calls:
++                tool = tools.get(call['name'])
++                result = tool.invoke(call['args']) if tool else 'Error: tool unavailable in this workflow.'
++                results.append({'tool': call['name'], 'args': call['args'], 'result': result})
++                messages.append(ToolMessage(content=str(result), tool_call_id=call['id']))
++        else:
++            return {'action_results': results, 'error': 'Tool limit reached; remaining actions were not completed.'}
++        return {'action_results': results, 'action_plan': [{'action': 'check_inventory', 'entities': state.get('entities', {})}]}
++    except Exception as exc:
++        logger.exception('Inventory queries and adjustments failed')
++        return {'action_results': results, 'error': str(exc)}
+diff --git a/agents/graph/nodes/check_invoice_node.py b/agents/graph/nodes/check_invoice_node.py
+index 051ad3e..2d990cc 100644
+--- a/agents/graph/nodes/check_invoice_node.py
++++ b/agents/graph/nodes/check_invoice_node.py
+@@ -1,91 +1,41 @@
+-'''
+-what the file does?
+-This module implements the check_invoice_node workflow node, handling invoice and overdue balance lookups, customer payment histories, and days overdue calculations via LLM tool execution.
+-
+-Classes:
+-    None (LangGraph workflow node module)
+-
+-Methods:
+-    _get_tools_for_invoice: Returns invoice-related LangChain tools for binding to the LLM.
+-    check_invoice_node: Workflow node executing invoice status queries and returning action results.
+-'''
+-
+-from langchain_groq import ChatGroq
++"""Invoice facts and reminder drafts"""
++import logging
++from datetime import datetime, timezone
+ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+-
+ from agents.graph.state import AgentState
+ from agents.tools import ALL_TOOLS
+ from agents.prompts.prompts import SYSTEM_PROMPT
+ from agents.llm import get_llm
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def _get_tools_for_invoice() -> list:
+-    relevant = {
+-        "search_customer", "get_invoice", "find_overdue_invoices",
+-        "get_days_overdue", "get_customer_history",
+-    }
++    relevant = {"search_customer", "get_customer_details", "get_invoice", "find_overdue_invoices", "get_days_overdue", "get_customer_history", "log_communication", "get_communication_history"}
+     return [t for t in ALL_TOOLS if t.name in relevant]
+ 
+ 
+ def check_invoice_node(state: AgentState) -> dict:
+-    """Execute the invoice status / overdue workflow."""
+-    user_input = state["user_input"]
+-    entities = state.get("entities", {})
+-
+-    context_parts = [f"User request: {user_input}"]
+-    if entities.get("customer_name"):
+-        context_parts.append(f"Customer: {entities['customer_name']}")
+-    if entities.get("invoice_id"):
+-        context_parts.append(f"Invoice: {entities['invoice_id']}")
+-    if entities.get("customer_id"):
+-        context_parts.append(f"Customer ID: {entities['customer_id']}")
+-
+-    context = "\n".join(context_parts)
+-    prompt = (
+-        f"{context}\n\n"
+-        "Handle this invoice/payment request:\n"
+-        "- For a specific invoice, use get_invoice.\n"
+-        "- For overdue invoices (one customer), use find_overdue_invoices with the customer ID.\n"
+-        "- For all overdue invoices, use find_overdue_invoices with 'all'.\n"
+-        "- For days overdue on a specific invoice, use get_days_overdue."
+-    )
+-
++    results = []
+     try:
+-        llm = get_llm().bind_tools(_get_tools_for_invoice())
+-
+-        messages = [
+-            SystemMessage(content=SYSTEM_PROMPT),
+-            HumanMessage(content=prompt),
+-        ]
+-        tool_results = []
+-
+-        for _ in range(4):
++        tools = {t.name: t for t in _get_tools_for_invoice()}
++        llm = get_llm().bind_tools(list(tools.values()))
++        prompt = state['user_input'] + '\nCurrent UTC time: ' + datetime.now(timezone.utc).isoformat() + '\nUse invoice tools for balances and overdue calculations. You cannot record payments or send email. When asked for a reminder, log an outbound email draft linked to the invoice UUID, and describe it as a draft.'
++        messages = [SystemMessage(content=SYSTEM_PROMPT), *state.get('messages', [])[-20:], HumanMessage(content=prompt)]
++        for _ in range(6):
+             response = llm.invoke(messages)
+             messages.append(response)
+-
+-            if not (hasattr(response, "tool_calls") and response.tool_calls):
++            if not response.tool_calls:
++                results.append({'tool': 'direct_response', 'result': response.content})
+                 break
+-
+-            for tool_call in response.tool_calls:
+-                tool_fn = next((t for t in ALL_TOOLS if t.name == tool_call["name"]), None)
+-                if tool_fn:
+-                    result = tool_fn.invoke(tool_call["args"])
+-                    tool_results.append({
+-                        "tool": tool_call["name"],
+-                        "args": tool_call["args"],
+-                        "result": result,
+-                    })
+-                    messages.append(
+-                        ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+-                    )
+-
+-        return {
+-            "action_plan": [{"action": "check_invoice", "entities": entities}],
+-            "action_results": tool_results,
+-        }
+-
+-    except Exception as e:
+-        return {
+-            "action_results": [],
+-            "error": f"Invoice workflow failed: {e}",
+-        }
++            for call in response.tool_calls:
++                tool = tools.get(call['name'])
++                result = tool.invoke(call['args']) if tool else 'Error: tool unavailable in this workflow.'
++                results.append({'tool': call['name'], 'args': call['args'], 'result': result})
++                messages.append(ToolMessage(content=str(result), tool_call_id=call['id']))
++        else:
++            return {'action_results': results, 'error': 'Tool limit reached; remaining actions were not completed.'}
++        return {'action_results': results, 'action_plan': [{'action': 'check_invoice', 'entities': state.get('entities', {})}]}
++    except Exception as exc:
++        logger.exception('Invoice facts and reminder drafts failed')
++        return {'action_results': results, 'error': str(exc)}
+diff --git a/agents/graph/nodes/classify_intent.py b/agents/graph/nodes/classify_intent.py
+index c71ac6c..7793ee2 100644
+--- a/agents/graph/nodes/classify_intent.py
++++ b/agents/graph/nodes/classify_intent.py
+@@ -1,3 +1,5 @@
++import logging
++logger = logging.getLogger(__name__)
+ '''
+ what the file does?
+ This module implements the classify_intent graph node, which uses an LLM call (with keyword fallback) to categorize user requests into one of the six supported business workflows.
+@@ -11,12 +13,12 @@ Methods:
+     _keyword_fallback: Rule-based heuristic fallback to classify intent based on keywords when LLM fails.
+ '''
+ 
+-import re
++
+ 
+ from langchain_groq import ChatGroq
+ 
+ from agents.graph.state import AgentState, ALL_WORKFLOWS
+-from agents.prompts.prompts import INTENT_CLASSIFICATION_PROMPT, SYSTEM_PROMPT
++from agents.prompts.prompts import INTENT_CLASSIFICATION_PROMPT
+ from agents.llm import get_llm
+ 
+ 
+@@ -35,11 +37,11 @@ def classify_intent(state: AgentState) -> dict:
+     if not user_input:
+         return {"intent": "customer_management", "error": "Empty user input"}
+ 
+-    llm = _get_llm()
+     prompt = INTENT_CLASSIFICATION_PROMPT.format(user_input=user_input)
+ 
+     try:
+-        response = llm.invoke(prompt)
++        llm = _get_llm()
++        response = llm.invoke([*state.get("messages", [])[-20:], ("human", prompt)])
+         raw_intent = response.content.strip().lower()
+ 
+         # Extract the workflow name from the response (handles extra text gracefully)
+@@ -56,19 +58,23 @@ def classify_intent(state: AgentState) -> dict:
+         return {"intent": detected_intent}
+ 
+     except Exception as e:
++        logger.exception('Operation failed')
+         return {
+             "intent": _keyword_fallback(user_input),
+-            "error": f"Intent classification error (using keyword fallback): {e}",
+         }
+ 
+ 
+ def _keyword_fallback(user_input: str) -> str:
+     """Simple keyword-based fallback when LLM classification fails."""
+     text = user_input.lower()
++    if any(w in text for w in ["complaint", "refund", "wrong", "return"]):
++        return "issue_resolution"
++    if any(w in text for w in ["follow", "remind", "check in"]):
++        return "follow_up"
+ 
+     if any(w in text for w in ["stock", "inventory", "fulfil", "available", "units", "restock"]):
+         return "inventory_check"
+-    if any(w in text for w in ["quote", "discount", "price", "pricing"]):
++    if any(w in text for w in ["quote", "discount", "price", "pricing", "order"]):
+         return "create_quote"
+     if any(w in text for w in ["invoice", "payment", "overdue", "paid", "bill"]):
+         return "invoice_status"
+diff --git a/agents/graph/nodes/create_quote_node.py b/agents/graph/nodes/create_quote_node.py
+index 655d0ae..a69d606 100644
+--- a/agents/graph/nodes/create_quote_node.py
++++ b/agents/graph/nodes/create_quote_node.py
+@@ -1,167 +1,58 @@
+-'''
+-what the file does?
+-This module implements the create_quote_node workflow node, orchestrating quote lookups, policy checks, discount applications, approval gating for high discounts, and quote-to-order conversions.
+-
+-Classes:
+-    None (LangGraph workflow node module)
+-
+-Methods:
+-    _get_tools_for_quote: Filters ALL_TOOLS to the set required for quoting and policy enforcement.
+-    create_quote_node: Workflow node executing quote adjustments, checking discount policy thresholds, and raising approval flags when required.
+-'''
+-
+-from langchain_groq import ChatGroq
+-from langchain_core.messages import SystemMessage, HumanMessage
+-
++"""Quote tools with a durable, deterministic approval boundary."""
++import logging
++from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
++from langchain_core.runnables import RunnableConfig
++from langgraph.errors import GraphInterrupt
+ from agents.graph.state import AgentState
+ from agents.tools import ALL_TOOLS
+ from agents.prompts.prompts import SYSTEM_PROMPT
+ from agents.llm import get_llm
++from backend.app.services.exceptions import ApprovalRequired
++from agents.graph.nodes.approval_helpers import saved_approval, review_action
+ 
++logger = logging.getLogger(__name__)
+ 
+-def _get_tools_for_quote() -> list:
+-    relevant = {
+-        "search_customer", "get_customer_details",
+-        "get_quote", "apply_discount_to_quote", "convert_quote_to_order",
+-        "check_stock", "check_fulfillment_feasibility",
+-        "search_business_policy",
+-    }
+-    return [t for t in ALL_TOOLS if t.name in relevant]
+-
+-
+-def create_quote_node(state: AgentState) -> dict:
+-    """Execute the quotation workflow.
+ 
+-    Handles: discount policy lookup, discount application with approval check,
+-    and quote-to-order conversion.
+-
+-    Sets approval_required=True if the discount exceeds the policy threshold.
+-    """
+-    user_input = state["user_input"]
+-    entities = state.get("entities", {})
+-
+-    context_parts = [f"User request: {user_input}"]
+-    if entities.get("customer_name"):
+-        context_parts.append(f"Customer: {entities['customer_name']}")
+-    if entities.get("discount_percent"):
+-        context_parts.append(f"Requested discount: {entities['discount_percent']}%")
+-    if entities.get("quote_id"):
+-        context_parts.append(f"Quote ID: {entities['quote_id']}")
++def _get_tools_for_quote():
++    relevant = {"search_customer", "get_customer_details", "get_quote",
++                "apply_discount_to_quote", "convert_quote_to_order", "check_stock",
++                "check_fulfillment_feasibility", "search_business_policy",
++                "get_customer_history", "get_order_status", "update_order_status", "fulfill_order"}
++    return [t for t in ALL_TOOLS if t.name in relevant]
+ 
+-    context = "\n".join(context_parts)
+-    prompt = (
+-        f"{context}\n\n"
+-        "Handle this quotation request. Steps:\n"
+-        "1. If a customer is mentioned but no ID given, use search_customer first.\n"
+-        "2. Use search_business_policy to look up the discount policy before applying any discount.\n"
+-        "3. Apply the discount using apply_discount_to_quote.\n"
+-        "4. If the response says 'APPROVAL REQUIRED', stop — do not convert to order.\n"
+-        "5. Only convert to order if the quote is approved and the user explicitly requests it."
+-    )
+ 
++def create_quote_node(state: AgentState, config: RunnableConfig) -> dict:
++    results = []
++    action_type = "quote_discount_approval"
++    # Failures while resuming must leave a retriable checkpoint, not end the graph.
++    if saved_approval(state, action_type):
++        return review_action(state, config, action_type)
+     try:
+-        llm = get_llm().bind_tools(_get_tools_for_quote())
+-
+-        messages = [
+-            SystemMessage(content=SYSTEM_PROMPT),
+-            HumanMessage(content=prompt),
+-        ]
+-
+-        # Agentic loop — let the LLM call tools until it stops
+-        tool_results = []
+-        approval_required = False
+-        max_iterations = 6
+-
+-        for _ in range(max_iterations):
++        tools = {t.name: t for t in _get_tools_for_quote()}
++        llm = get_llm().bind_tools(list(tools.values()))
++        messages = [SystemMessage(content=SYSTEM_PROMPT), *state.get("messages", []),
++                    HumanMessage(content=state["user_input"] + "\nResolve identifiers using tools. "
++                                 "Apply only requested changes. Convert or fulfill only when explicitly requested. "
++                                 "New quote creation is not supported; explain this if requested.")]
++        for _ in range(6):
+             response = llm.invoke(messages)
+             messages.append(response)
+-
+-            if not (hasattr(response, "tool_calls") and response.tool_calls):
+-                break
+-
+-            from langchain_core.messages import ToolMessage
+-            for tool_call in response.tool_calls:
+-                tool_fn = next((t for t in ALL_TOOLS if t.name == tool_call["name"]), None)
+-                if tool_fn:
+-                    result = tool_fn.invoke(tool_call["args"])
+-                    tool_results.append({
+-                        "tool": tool_call["name"],
+-                        "args": tool_call["args"],
+-                        "result": result,
+-                    })
+-                    # Detect approval flag from the tool output
+-                    if "APPROVAL REQUIRED" in str(result):
+-                        approval_required = True
+-
+-                    messages.append(
+-                        ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+-                    )
+-
+-            if approval_required:
++            if not response.tool_calls:
++                results.append({"tool": "direct_response", "result": response.content})
+                 break
+-
+-        # Also inspect entities and user input for discounts exceeding standard 10% threshold
+-        import re
+-        for k, v in entities.items():
+-            if "discount" in k.lower():
+-                try:
+-                    d_val = float(str(v).replace("%", "").strip())
+-                    if d_val > 10:
+-                        approval_required = True
+-                except (ValueError, TypeError):
+-                    pass
+-
+-        disc_match = re.search(r"(\d+(?:\.\d+)?)\s*%\s*discount", state.get("user_input", ""), re.IGNORECASE)
+-        if disc_match and float(disc_match.group(1)) > 10:
+-            approval_required = True
+-
+-        approval_id = state.get("approval_id")
+-        approval_decision = state.get("approval_decision")
+-
+-        # Human-in-the-loop interrupt if approval is required and not yet decided
+-        if approval_required and not approval_decision:
+-            import uuid
+-            approval_id = approval_id or str(uuid.uuid4())
+-            try:
+-                from backend.app.db.database import SessionLocal
+-                from backend.app.services.approval_service import ApprovalService
+-                with SessionLocal() as db:
+-                    service = ApprovalService(db)
+-                    service.request_approval(
+-                        action_type="quote_discount_approval",
+-                        action_payload={"entities": entities, "thread_id": state.get("request_id")},
+-                        reason="Discount exceeds standard policy threshold (>10%). Requires manager approval.",
+-                    )
+-            except Exception:
+-                pass
+-
+-            try:
+-                from langgraph.types import interrupt
+-                decision_payload = interrupt({
+-                    "approval_id": approval_id,
+-                    "action_type": "quote_discount_approval",
+-                    "reason": "Discount exceeds standard policy threshold (>10%). Requires manager approval.",
+-                    "payload": entities,
+-                })
+-                approved = decision_payload.get("approved", False) if isinstance(decision_payload, dict) else bool(decision_payload)
+-                approval_decision = "approved" if approved else "rejected"
+-                tool_results.append({
+-                    "tool": "manager_approval",
+-                    "result": f"Manager decision received: {approval_decision.upper()}.",
+-                })
+-            except Exception:
+-                pass
+-
+-        return {
+-            "action_plan": [{"action": "create_quote", "entities": entities}],
+-            "action_results": tool_results,
+-            "approval_required": approval_required,
+-            "approval_id": approval_id,
+-            "approval_decision": approval_decision,
+-        }
+-
+-    except Exception as e:
+-        return {
+-            "action_results": [],
+-            "error": f"Quote workflow failed: {e}",
+-        }
++            for call in response.tool_calls:
++                tool = tools.get(call["name"])
++                result = tool.invoke(call["args"]) if tool else "Error: tool unavailable in this workflow."
++                results.append({"tool": call["name"], "args": call["args"], "result": result})
++                messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
++        else:
++            return {"action_results": results, "error": "Quote workflow reached its tool limit; remaining actions were not completed."}
++        return {"action_plan": [{"action": "create_quote", "entities": state.get("entities", {})}],
++                "action_results": results}
++    except ApprovalRequired as proposal:
++        return review_action(state, config, proposal.action_type, proposal.payload, proposal.reason, results)
++    except GraphInterrupt:
++        raise
++    except Exception as exc:
++        logger.exception("Quote workflow failed")
++        return {"action_results": results, "error": f"Quote workflow failed: {exc}"}
+diff --git a/agents/graph/nodes/customer_mgmt_node.py b/agents/graph/nodes/customer_mgmt_node.py
+index d18b0c5..d141efd 100644
+--- a/agents/graph/nodes/customer_mgmt_node.py
++++ b/agents/graph/nodes/customer_mgmt_node.py
+@@ -1,89 +1,41 @@
+-'''
+-what the file does?
+-This module implements the customer_mgmt_node workflow node, handling customer searches, profile lookups, communication history reviews, and general CRM interactions.
+-
+-Classes:
+-    None (LangGraph workflow node module)
+-
+-Methods:
+-    _get_tools_for_customer: Returns customer-related LangChain tools for LLM binding.
+-    customer_mgmt_node: Workflow node executing customer CRM actions and updating state with results.
+-'''
+-
+-from langchain_groq import ChatGroq
++"""Customer lookup and communication history"""
++import logging
++from datetime import datetime, timezone
+ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+-
+ from agents.graph.state import AgentState
+ from agents.tools import ALL_TOOLS
+ from agents.prompts.prompts import SYSTEM_PROMPT
+ from agents.llm import get_llm
+ 
++logger = logging.getLogger(__name__)
++
+ 
+ def _get_tools_for_customer() -> list:
+-    relevant = {
+-        "search_customer", "get_customer_details", "get_customer_history",
+-        "get_communication_history", "log_communication",
+-    }
++    relevant = {"search_customer", "get_customer_details", "get_customer_history", "get_communication_history", "log_communication"}
+     return [t for t in ALL_TOOLS if t.name in relevant]
+ 
+ 
+ def customer_mgmt_node(state: AgentState) -> dict:
+-    """Execute the customer management workflow."""
+-    user_input = state["user_input"]
+-    entities = state.get("entities", {})
+-
+-    context_parts = [f"User request: {user_input}"]
+-    if entities.get("customer_name"):
+-        context_parts.append(f"Customer: {entities['customer_name']}")
+-    if entities.get("customer_id"):
+-        context_parts.append(f"Customer ID: {entities['customer_id']}")
+-
+-    context = "\n".join(context_parts)
+-    prompt = (
+-        f"{context}\n\n"
+-        "Handle this customer management request:\n"
+-        "- If a customer name is given but no ID, use search_customer first.\n"
+-        "- For full account history (orders, invoices, communications), use get_customer_history.\n"
+-        "- For just communication history, use get_communication_history.\n"
+-        "- For a quick profile view, use get_customer_details."
+-    )
+-
++    results = []
+     try:
+-        llm = get_llm().bind_tools(_get_tools_for_customer())
+-
+-        messages = [
+-            SystemMessage(content=SYSTEM_PROMPT),
+-            HumanMessage(content=prompt),
+-        ]
+-        tool_results = []
+-
+-        for _ in range(4):
++        tools = {t.name: t for t in _get_tools_for_customer()}
++        llm = get_llm().bind_tools(list(tools.values()))
++        prompt = state['user_input'] + '\nCurrent UTC time: ' + datetime.now(timezone.utc).isoformat() + '\nUse search_customer to resolve names, then inspect profiles or history. Customer record creation and editing are not available; explain the limitation when requested.'
++        messages = [SystemMessage(content=SYSTEM_PROMPT), *state.get('messages', [])[-20:], HumanMessage(content=prompt)]
++        for _ in range(6):
+             response = llm.invoke(messages)
+             messages.append(response)
+-
+-            if not (hasattr(response, "tool_calls") and response.tool_calls):
++            if not response.tool_calls:
++                results.append({'tool': 'direct_response', 'result': response.content})
+                 break
+-
+-            for tool_call in response.tool_calls:
+-                tool_fn = next((t for t in ALL_TOOLS if t.name == tool_call["name"]), None)
+-                if tool_fn:
+-                    result = tool_fn.invoke(tool_call["args"])
+-                    tool_results.append({
+-                        "tool": tool_call["name"],
+-                        "args": tool_call["args"],
+-                        "result": result,
+-                    })
+-                    messages.append(
+-                        ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+-                    )
+-
+-        return {
+-            "action_plan": [{"action": "customer_management", "entities": entities}],
+-            "action_results": tool_results,
+-        }
+-
+-    except Exception as e:
+-        return {
+-            "action_results": [],
+-            "error": f"Customer management workflow failed: {e}",
+-        }
++            for call in response.tool_calls:
++                tool = tools.get(call['name'])
++                result = tool.invoke(call['args']) if tool else 'Error: tool unavailable in this workflow.'
++                results.append({'tool': call['name'], 'args': call['args'], 'result': result})
++                messages.append(ToolMessage(content=str(result), tool_call_id=call['id']))
++        else:
++            return {'action_results': results, 'error': 'Tool limit reached; remaining actions were not completed.'}
++        return {'action_results': results, 'action_plan': [{'action': 'customer_management', 'entities': state.get('entities', {})}]}
++    except Exception as exc:
++        logger.exception('Customer lookup and communication history failed')
++        return {'action_results': results, 'error': str(exc)}
+diff --git a/agents/graph/nodes/followup_node.py b/agents/graph/nodes/followup_node.py
+index 86e0598..799be8a 100644
+--- a/agents/graph/nodes/followup_node.py
++++ b/agents/graph/nodes/followup_node.py
+@@ -1,161 +1,41 @@
+-'''
+-what the file does?
+-This module implements the followup_node workflow node, creating scheduled followup tasks, triggering automated customer reminders, and performing bulk follow-ups on aging quotes or overdue invoices.
+-
+-Classes:
+-    None (LangGraph workflow node module)
+-
+-Methods:
+-    _get_tools_for_followup: Returns communication and customer tools for follow-up workflows.
+-    followup_node: Workflow node that schedules tasks, records follow-up communications, and executes automated reminders.
+-'''
+-
+-import uuid
++"""Individual scheduling and follow-up logging"""
++import logging
+ from datetime import datetime, timezone
+-from typing import Any
+-
+-from langchain_groq import ChatGroq
+ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+-from sqlalchemy import select, text
+-
+ from agents.graph.state import AgentState
+ from agents.tools import ALL_TOOLS
+ from agents.prompts.prompts import SYSTEM_PROMPT
+ from agents.llm import get_llm
+-from backend.app.db.database import SessionLocal
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ def _get_tools_for_followup() -> list:
+-    relevant = {
+-        "search_customer", "get_customer_details", "get_customer_history",
+-        "log_communication", "get_communication_history",
+-        "find_overdue_invoices",
+-    }
++    relevant = {"search_customer", "get_customer_details", "get_customer_history", "get_communication_history", "log_communication", "find_overdue_invoices", "get_invoice", "get_quote", "create_followup_task"}
+     return [t for t in ALL_TOOLS if t.name in relevant]
+ 
+ 
+ def followup_node(state: AgentState) -> dict:
+-    """Execute the follow-up workflow.
+-
+-    Two sub-cases:
+-    1. Explicit follow-up: user names a customer + timeframe → creates followup_task
+-    2. Bulk follow-up: find and action quotes/invoices past a threshold
+-    """
+-    user_input = state["user_input"]
+-    entities = state.get("entities", {})
+-
+-    context_parts = [f"User request: {user_input}"]
+-    if entities.get("customer_name"):
+-        context_parts.append(f"Customer: {entities['customer_name']}")
+-    if entities.get("date"):
+-        context_parts.append(f"Timeframe: {entities['date']}")
+-
+-    context = "\n".join(context_parts)
+-    prompt = (
+-        f"{context}\n\n"
+-        "Handle this follow-up request:\n"
+-        "1. If the user names a specific customer, look them up with search_customer.\n"
+-        "2. If this is a bulk follow-up (e.g., 'all overdue invoices'), "
+-        "use find_overdue_invoices to get the list.\n"
+-        "3. Log a note or email communication for each customer you follow up with.\n"
+-        "4. Summarize what follow-ups were scheduled or executed."
+-    )
+-
++    results = []
+     try:
+-        llm = get_llm().bind_tools(_get_tools_for_followup())
+-
+-        messages = [
+-            SystemMessage(content=SYSTEM_PROMPT),
+-            HumanMessage(content=prompt),
+-        ]
+-        tool_results = []
+-
++        tools = {t.name: t for t in _get_tools_for_followup()}
++        llm = get_llm().bind_tools(list(tools.values()))
++        prompt = state['user_input'] + '\nCurrent UTC time: ' + datetime.now(timezone.utc).isoformat() + '\nFor a future reminder, resolve the customer and call create_followup_task; do not log a communication now. Ask for a time and timezone if unknown; never replace an unparseable date with now. For a due task, check the referenced quote or invoice and log a note or email draft with its related entity UUID. Tools log drafts but cannot send messages. Stale quote discovery is unavailable.'
++        messages = [SystemMessage(content=SYSTEM_PROMPT), *state.get('messages', [])[-20:], HumanMessage(content=prompt)]
+         for _ in range(6):
+             response = llm.invoke(messages)
+             messages.append(response)
+-
+-            if not (hasattr(response, "tool_calls") and response.tool_calls):
++            if not response.tool_calls:
++                results.append({'tool': 'direct_response', 'result': response.content})
+                 break
+-
+-            for tool_call in response.tool_calls:
+-                tool_fn = next((t for t in ALL_TOOLS if t.name == tool_call["name"]), None)
+-                if tool_fn:
+-                    result = tool_fn.invoke(tool_call["args"])
+-                    tool_results.append({
+-                        "tool": tool_call["name"],
+-                        "args": tool_call["args"],
+-                        "result": result,
+-                    })
+-                    messages.append(
+-                        ToolMessage(content=str(result), tool_call_id=tool_call["id"])
+-                    )
+-
+-        # Optionally create a followup_task record if a specific date was extracted
+-        task_id = None
+-        if entities.get("date") and entities.get("customer_id"):
+-            task_id = _create_followup_task(
+-                customer_id=entities["customer_id"],
+-                scheduled_at_str=entities["date"],
+-                task_type="manual_reminder",
+-            )
+-
+-        if task_id:
+-            tool_results.append({
+-                "tool": "create_followup_task",
+-                "result": f"Follow-up task created: {task_id}",
+-            })
+-
+-        return {
+-            "action_plan": [{"action": "follow_up", "entities": entities}],
+-            "action_results": tool_results,
+-        }
+-
+-    except Exception as e:
+-        return {
+-            "action_results": [],
+-            "error": f"Follow-up workflow failed: {e}",
+-        }
+-
+-
+-def _create_followup_task(
+-    customer_id: str,
+-    scheduled_at_str: str,
+-    task_type: str = "manual_reminder",
+-    quote_id: str | None = None,
+-) -> str | None:
+-    """Insert a followup_tasks row and return the new task ID."""
+-    try:
+-        # Parse a simple date string — production would use dateparser
+-        from datetime import datetime
+-        # Try ISO format first, then fallback
+-        try:
+-            scheduled_at = datetime.fromisoformat(scheduled_at_str)
+-        except ValueError:
+-            scheduled_at = datetime.now(timezone.utc)
+-
+-        task_id = str(uuid.uuid4())
+-        session = SessionLocal()
+-        try:
+-            session.execute(
+-                text(
+-                    """
+-                    INSERT INTO followup_tasks
+-                        (id, task_type, customer_id, quote_id, scheduled_at, status, created_at)
+-                    VALUES
+-                        (:id, :task_type, :customer_id, :quote_id, :scheduled_at, 'pending', now())
+-                    """
+-                ),
+-                {
+-                    "id": task_id,
+-                    "task_type": task_type,
+-                    "customer_id": customer_id,
+-                    "quote_id": quote_id,
+-                    "scheduled_at": scheduled_at,
+-                },
+-            )
+-            session.commit()
+-            return task_id
+-        finally:
+-            session.close()
+-    except Exception:
+-        return None
++            for call in response.tool_calls:
++                tool = tools.get(call['name'])
++                result = tool.invoke(call['args']) if tool else 'Error: tool unavailable in this workflow.'
++                results.append({'tool': call['name'], 'args': call['args'], 'result': result})
++                messages.append(ToolMessage(content=str(result), tool_call_id=call['id']))
++        else:
++            return {'action_results': results, 'error': 'Tool limit reached; remaining actions were not completed.'}
++        return {'action_results': results, 'action_plan': [{'action': 'follow_up', 'entities': state.get('entities', {})}]}
++    except Exception as exc:
++        logger.exception('Individual scheduling and follow-up logging failed')
++        return {'action_results': results, 'error': str(exc)}
+diff --git a/agents/graph/nodes/formulate_response.py b/agents/graph/nodes/formulate_response.py
+index 0752709..b738f3d 100644
+--- a/agents/graph/nodes/formulate_response.py
++++ b/agents/graph/nodes/formulate_response.py
+@@ -1,3 +1,5 @@
++import logging
++logger = logging.getLogger(__name__)
+ '''
+ what the file does?
+ This module implements the formulate_response graph node, synthesizing tool outputs, execution errors, or pending approval requests into a clear, professional natural-language reply for the user.
+@@ -9,11 +11,11 @@ Methods:
+     formulate_response: Graph node synthesizing tool results or approval gates into the final natural language response.
+ '''
+ 
+-from langchain_groq import ChatGroq
+-from langchain_core.messages import HumanMessage
++
++from langchain_core.messages import HumanMessage, SystemMessage
+ 
+ from agents.graph.state import AgentState
+-from agents.prompts.prompts import RESPONSE_PROMPT
++from agents.prompts.prompts import RESPONSE_PROMPT, SYSTEM_PROMPT
+ from agents.llm import get_llm
+ 
+ 
+@@ -28,10 +30,14 @@ def formulate_response(state: AgentState) -> dict:
+     approval_required = state.get("approval_required", False)
+     action_results = state.get("action_results", [])
+     workflow = state.get("workflow", "unknown")
++    failed = [r for r in action_results if str(r.get("result", "")).startswith("Error")]
++    if failed:
++        error = error or "; ".join(str(r["result"]) for r in failed)
+ 
+     # --- Error path ---
+-    if error and not action_results:
++    if error:
+         return {
++            "error": error,
+             "response": (
+                 f"I encountered an issue processing your request: {error}\n"
+                 "Please check the details and try again, or contact support if the problem persists."
+@@ -63,7 +69,7 @@ def formulate_response(state: AgentState) -> dict:
+             return {
+                 "response": (
+                     "✅ **Manager Approval Granted**\n\n"
+-                    f"The operation has been approved and completed.\n{results_text}"
++                    f"The manager decision was recorded.\n{results_text}"
+                 )
+             }
+         else:
+@@ -82,14 +88,15 @@ def formulate_response(state: AgentState) -> dict:
+             action_results=results_text or "No actions were taken.",
+             approval_required=approval_required,
+         )
+-        response = llm.invoke([HumanMessage(content=prompt)])
++        response = llm.invoke([SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content="Original request: " + state["user_input"] + "\n" + prompt)])
+         return {"response": response.content.strip()}
+ 
+     except Exception as e:
++        logger.exception('Operation failed')
+         # Fallback: just return the raw results
+         return {
+             "response": (
+-                f"Request completed ({workflow}).\n"
++                f"Recorded results ({workflow}); response generation was unavailable.\n"
+                 f"Results:{results_text}"
+             )
+         }
+diff --git a/agents/graph/nodes/identify_entities.py b/agents/graph/nodes/identify_entities.py
+index 076825a..71e3680 100644
+--- a/agents/graph/nodes/identify_entities.py
++++ b/agents/graph/nodes/identify_entities.py
+@@ -1,3 +1,5 @@
++import logging
++logger = logging.getLogger(__name__)
+ '''
+ what the file does?
+ This module implements the identify_entities graph node, which extracts structured domain entities (customer IDs/names, product SKUs, quantities, monetary values, dates) from user requests using LLM-driven JSON extraction.
+@@ -37,11 +39,11 @@ def identify_entities(state: AgentState) -> dict:
+     if not user_input:
+         return {"entities": {}}
+ 
+-    llm = _get_llm()
+     prompt = ENTITY_EXTRACTION_PROMPT.format(user_input=user_input)
+ 
+     try:
+-        response = llm.invoke(prompt)
++        llm = _get_llm()
++        response = llm.invoke([*state.get("messages", [])[-20:], ("human", prompt)])
+         raw = response.content.strip()
+ 
+         # Extract JSON from the response (handle markdown code blocks)
+@@ -56,6 +58,7 @@ def identify_entities(state: AgentState) -> dict:
+         return {"entities": entities}
+ 
+     except Exception as e:
++        logger.exception('Operation failed')
+         # Non-fatal — the workflow nodes will ask for clarification if they
+         # need an entity that's missing
+-        return {"entities": {}, "error": f"Entity extraction warning: {e}"}
++        return {"entities": {}}
+diff --git a/agents/graph/nodes/resolve_issue_node.py b/agents/graph/nodes/resolve_issue_node.py
+index d327717..bc0bdc8 100644
+--- a/agents/graph/nodes/resolve_issue_node.py
++++ b/agents/graph/nodes/resolve_issue_node.py
+@@ -1,148 +1,60 @@
+-'''
+-what the file does?
+-This module implements the resolve_issue_node workflow node, handling customer complaints, returns, refund evaluations against business policy, and approval escalations for high-value refunds.
+-
+-Classes:
+-    None (LangGraph workflow node module)
+-
+-Methods:
+-    _get_tools_for_issue: Returns relevant LangChain tools for issue triage and policy verification.
+-    resolve_issue_node: Workflow node that queries orders/policies, evaluates refund eligibility, and triggers approvals if needed.
+-'''
+-
+-from langchain_groq import ChatGroq
++"""Issue review; threshold decisions run in Python, never in a prompt."""
++import logging
++from decimal import Decimal
+ from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
+-
++from langchain_core.runnables import RunnableConfig
++from langgraph.errors import GraphInterrupt
+ from agents.graph.state import AgentState
+ from agents.tools import ALL_TOOLS
+ from agents.prompts.prompts import SYSTEM_PROMPT
+ from agents.llm import get_llm
++from agents.graph.nodes.approval_helpers import saved_approval, review_action
++from backend.app.services.authorization_service import check_refund_authorization
+ 
++logger = logging.getLogger(__name__)
+ 
+-def _get_tools_for_issue() -> list:
+-    relevant = {
+-        "search_customer", "get_customer_details", "get_customer_history",
+-        "get_order_status", "get_invoice",
+-        "log_communication",
+-        "search_business_policy",
+-    }
+-    return [t for t in ALL_TOOLS if t.name in relevant]
+-
+-
+-def resolve_issue_node(state: AgentState) -> dict:
+-    """Execute the issue resolution workflow.
+-
+-    Looks up the customer and related order/invoice, retrieves the return/refund
+-    policy, determines if approval is needed (refund > $500), and logs the
+-    communication. Sets approval_required if the refund amount exceeds the threshold.
+-    """
+-    user_input = state["user_input"]
+-    entities = state.get("entities", {})
+ 
+-    context_parts = [f"User request: {user_input}"]
+-    if entities.get("customer_name"):
+-        context_parts.append(f"Customer: {entities['customer_name']}")
+-    if entities.get("order_id"):
+-        context_parts.append(f"Order: {entities['order_id']}")
+-    if entities.get("amount"):
+-        context_parts.append(f"Amount: ${entities['amount']}")
++def _get_tools_for_issue():
++    relevant = {"search_customer", "get_customer_details", "get_customer_history",
++                "get_order_status", "get_invoice", "log_communication", "search_business_policy"}
++    return [t for t in ALL_TOOLS if t.name in relevant]
+ 
+-    context = "\n".join(context_parts)
+-    prompt = (
+-        f"{context}\n\n"
+-        "Handle this issue/complaint:\n"
+-        "1. Look up the customer if needed.\n"
+-        "2. Use search_business_policy to check the return and refund policy.\n"
+-        "3. Look up the related order or invoice if an ID is mentioned.\n"
+-        "4. If a refund is requested, check if it exceeds $500 (requires approval).\n"
+-        "5. Log a note communication after determining the resolution.\n"
+-        "6. Summarize what action was taken or what approval is needed."
+-    )
+ 
++def resolve_issue_node(state: AgentState, config: RunnableConfig) -> dict:
++    results = []
++    if saved_approval(state, "refund_approval"):
++        return review_action(state, config, "refund_approval")
+     try:
+-        llm = get_llm().bind_tools(_get_tools_for_issue())
+-
+-        messages = [
+-            SystemMessage(content=SYSTEM_PROMPT),
+-            HumanMessage(content=prompt),
+-        ]
+-        tool_results = []
+-        approval_required = False
+-
++        entities = state.get("entities", {})
++        if "refund" in state["user_input"].lower():
++            if entities.get("amount") is None:
++                return {"action_results": [{"tool": "direct_response", "result": "What refund amount should be reviewed? No refund has been issued."}]}
++            amount = Decimal(str(entities["amount"]).replace("$", "").replace(",", ""))
++            decision = check_refund_authorization(amount, Decimal("500"))
++            if decision.approval_required:
++                return review_action(state, config, "refund_approval", {"amount": str(amount), "entities": entities}, decision.reason)
++        tools = {t.name: t for t in _get_tools_for_issue()}
++        llm = get_llm().bind_tools(list(tools.values()))
++        messages = [SystemMessage(content=SYSTEM_PROMPT), *state.get("messages", []),
++                    HumanMessage(content=state["user_input"] + "\nReview facts and policy, and log a proposed resolution if requested. "
++                                 "Refunds, return labels and replacements cannot be executed by these tools. "
++                                 "Do not claim eligibility or authorization from policy prose alone; missing eligibility facts need human review.")]
+         for _ in range(6):
+             response = llm.invoke(messages)
+             messages.append(response)
+-
+-            if not (hasattr(response, "tool_calls") and response.tool_calls):
++            if not response.tool_calls:
++                results.append({"tool": "direct_response", "result": response.content})
+                 break
+-
+-            for tool_call in response.tool_calls:
+-                tool_fn = next((t for t in ALL_TOOLS if t.name == tool_call["name"]), None)
+-                if tool_fn:
+-                    result = tool_fn.invoke(tool_call["args"])
+-                    tool_results.append({
+-                        "tool": tool_call["name"],
+-                        "args": tool_call["args"],
+-                        "result": result,
+-                    })
+-                    # Detect if refund policy requires approval
+-                    result_str = str(result)
+-                    if "approval" in result_str.lower() and "require" in result_str.lower():
+-                        amount = entities.get("amount", 0)
+-                        if amount and float(str(amount).replace("$", "")) > 500:
+-                            approval_required = True
+-
+-                    messages.append(
+-                        ToolMessage(content=result_str, tool_call_id=tool_call["id"])
+-                    )
+-
+-        approval_id = state.get("approval_id")
+-        approval_decision = state.get("approval_decision")
+-
+-        # Human-in-the-loop interrupt if refund > $500 requires approval
+-        if approval_required and not approval_decision:
+-            import uuid
+-            approval_id = approval_id or str(uuid.uuid4())
+-            try:
+-                from backend.app.db.database import SessionLocal
+-                from backend.app.services.approval_service import ApprovalService
+-                with SessionLocal() as db:
+-                    service = ApprovalService(db)
+-                    service.request_approval(
+-                        action_type="refund_approval",
+-                        action_payload={"entities": entities, "thread_id": state.get("request_id")},
+-                        reason="Refund amount exceeds policy threshold ($500). Requires manager approval.",
+-                    )
+-            except Exception:
+-                pass
+-
+-            try:
+-                from langgraph.types import interrupt
+-                decision_payload = interrupt({
+-                    "approval_id": approval_id,
+-                    "action_type": "refund_approval",
+-                    "reason": "Refund amount exceeds policy threshold ($500). Requires manager approval.",
+-                    "payload": entities,
+-                })
+-                approved = decision_payload.get("approved", False) if isinstance(decision_payload, dict) else bool(decision_payload)
+-                approval_decision = "approved" if approved else "rejected"
+-                tool_results.append({
+-                    "tool": "manager_approval",
+-                    "result": f"Manager decision received: {approval_decision.upper()}.",
+-                })
+-            except Exception:
+-                pass
+-
+-        return {
+-            "action_plan": [{"action": "issue_resolution", "entities": entities}],
+-            "action_results": tool_results,
+-            "approval_required": approval_required,
+-            "approval_id": approval_id,
+-            "approval_decision": approval_decision,
+-        }
+-
+-    except Exception as e:
+-        return {
+-            "action_results": [],
+-            "error": f"Issue resolution workflow failed: {e}",
+-        }
++            for call in response.tool_calls:
++                tool = tools.get(call["name"])
++                result = tool.invoke(call["args"]) if tool else "Error: tool unavailable in this workflow."
++                results.append({"tool": call["name"], "args": call["args"], "result": result})
++                messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
++        else:
++            return {"action_results": results, "error": "Issue review reached its tool limit; remaining actions were not completed."}
++        return {"action_results": results, "action_plan": [{"action": "issue_resolution", "entities": entities}]}
++    except GraphInterrupt:
++        raise
++    except Exception as exc:
++        logger.exception("Issue workflow failed")
++        return {"action_results": results, "error": f"Issue workflow failed: {exc}"}
+diff --git a/agents/prompts/prompts.py b/agents/prompts/prompts.py
+index 776f516..67aaf0a 100644
+--- a/agents/prompts/prompts.py
++++ b/agents/prompts/prompts.py
+@@ -22,6 +22,9 @@ IMPORTANT RULES:
+ 3. You ALWAYS search business policy before making decisions about discounts, refunds, or exceptions.
+ 4. You ALWAYS log communications after taking outbound actions.
+ 5. Be concise and professional. Summarize what you did and what the outcome was.
++6. Logging an email creates a draft, not a sent email. Never claim delivery.
++7. Never infer success from prose: only report successful tool results. Ask for missing facts.
++8. Do not calculate outstanding balances or aggregate money yourself. If a tool does not return the requested calculation, explain that limitation.
+ """
+ 
+ # ---------------------------------------------------------------------------
+@@ -32,10 +35,10 @@ INTENT_CLASSIFICATION_PROMPT = """You are classifying a user request for an oper
+ 
+ Available workflows:
+ - inventory_check: Check stock levels, fulfillment feasibility, or low-stock products
+-- create_quote: Create or modify a quote, apply discounts, convert to order
+-- invoice_status: Check invoice status, find overdue invoices, record payments
++- create_quote: Inspect existing quotes/orders, apply discounts, convert or fulfill an order
++- invoice_status: Check invoice status, find overdue invoices, inspect payments
+ - issue_resolution: Handle complaints, returns, errors, or escalations
+-- customer_management: Look up or update customer info, view account history
++- customer_management: Look up customer info, view account history
+ - follow_up: Schedule or execute follow-up tasks, send reminders
+ 
+ User request: {user_input}
+diff --git a/agents/tools/__init__.py b/agents/tools/__init__.py
+index 1a0d0b9..e59cb19 100644
+--- a/agents/tools/__init__.py
++++ b/agents/tools/__init__.py
+@@ -40,8 +40,10 @@ from agents.tools.communication_tools import (
+     get_communication_history,
+ )
+ from agents.tools.policy_tools import search_business_policy
++from agents.tools.followup_tools import create_followup_task
+ 
+ ALL_TOOLS = [
++    create_followup_task,
+     # Customer management
+     search_customer,
+     get_customer_details,
+diff --git a/agents/tools/communication_tools.py b/agents/tools/communication_tools.py
+index fe0c640..cd3f0ea 100644
+--- a/agents/tools/communication_tools.py
++++ b/agents/tools/communication_tools.py
+@@ -1,3 +1,5 @@
++import logging
++logger = logging.getLogger(__name__)
+ '''
+ what the file does?
+ This module provides LangChain-compatible communication tracking tools for the operations agent, delegating to CommunicationService to record inbound/outbound interactions (emails, calls, notes, SMS) and retrieve communication history.
+@@ -71,6 +73,7 @@ def log_communication(
+             f"  Status: {comm.status}"
+         )
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error logging communication: {e}"
+     finally:
+         session.close()
+@@ -94,6 +97,7 @@ def get_communication_history(
+         comms = service.get_communication_history(
+             customer_id=UUID(customer_id),
+             communication_type=communication_type or None,
++            limit=limit,
+         )
+         if not comms:
+             return f"No communications found for customer {customer_id}."
+@@ -103,10 +107,11 @@ def get_communication_history(
+         for c in recent:
+             lines.append(
+                 f"  [{c.created_at.date()}] {c.type.upper()} ({c.direction}) — "
+-                f"{c.subject or '(no subject)'} | Status: {c.status}"
++                f"{c.subject or '(no subject)'} | Status: {c.status} | UUID: {c.id} | Body: {c.body or ''}"
+             )
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error retrieving communication history: {e}"
+     finally:
+         session.close()
+diff --git a/agents/tools/customer_tools.py b/agents/tools/customer_tools.py
+index 44e6faf..d74a484 100644
+--- a/agents/tools/customer_tools.py
++++ b/agents/tools/customer_tools.py
+@@ -1,3 +1,5 @@
++import logging
++logger = logging.getLogger(__name__)
+ '''
+ what the file does?
+ This module provides LangChain-compatible customer management tools for the operations agent, wrapping CustomerService to search customer records, retrieve detailed profile info, and pull unified historical interactions (orders, invoices, and communications).
+@@ -17,7 +19,7 @@ from uuid import UUID
+ 
+ from langchain_core.tools import tool
+ 
+-from backend.app.core.config import settings
++
+ from backend.app.db.database import SessionLocal
+ from backend.app.db.repositories.customer_repository import CustomerRepository
+ from backend.app.db.repositories.order_repository import OrderRepository
+@@ -59,6 +61,7 @@ def search_customer(
+             )
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error searching for customer: {e}"
+     finally:
+         session.close()
+@@ -86,6 +89,7 @@ def get_customer_details(
+             f"  Created: {customer.created_at.date()}"
+         )
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error retrieving customer: {e}"
+     finally:
+         session.close()
+@@ -109,10 +113,10 @@ def get_customer_history(
+         lines = [f"Customer history for ID {customer_id}:"]
+         lines.append(f"\nOrders ({len(orders)}):")
+         for o in orders:
+-            lines.append(f"  - {o.order_number} | Status: {o.status} | Total: ${o.total}")
++            lines.append(f"  - {o.order_number} | UUID: {o.id} | Status: {o.status} | Total: ${o.total}")
+         lines.append(f"\nInvoices ({len(invoices)}):")
+         for inv in invoices:
+-            lines.append(f"  - {inv.invoice_id} | Status: {inv.status} | Amount: ${inv.amount} | Due: {inv.due_date}")
++            lines.append(f"  - {inv.invoice_id} | UUID: {inv.id} | Status: {inv.status} | Amount: ${inv.amount} | Due: {inv.due_date}")
+         lines.append(f"\nCommunications ({len(comms)}):")
+         for comm in comms[:5]:  # bounded — don't dump the entire history
+             lines.append(f"  - [{comm.type}] {comm.subject or '(no subject)'} | Status: {comm.status}")
+@@ -120,6 +124,7 @@ def get_customer_history(
+             lines.append(f"  ... and {len(comms) - 5} more")
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error retrieving customer history: {e}"
+     finally:
+         session.close()
+diff --git a/agents/tools/inventory_tools.py b/agents/tools/inventory_tools.py
+index a144759..c6dfbf9 100644
+--- a/agents/tools/inventory_tools.py
++++ b/agents/tools/inventory_tools.py
+@@ -1,3 +1,5 @@
++import logging
++logger = logging.getLogger(__name__)
+ '''
+ what the file does?
+ This module provides LangChain-compatible inventory tools for the operations agent, wrapping InventoryService to allow checking stock levels, updating inventory balances, validating order fulfillment feasibility, and listing low-stock products.
+@@ -56,6 +58,8 @@ def _find_product(repo: ProductRepository, identifier: str):
+ 
+     # 3. Try search by name or SKU
+     matches = repo.search_by_name_or_sku(val_str)
++    if len(matches) > 1:
++        raise ValueError("Ambiguous product name. Specify one SKU: " + ", ".join(p.sku for p in matches))
+     if matches:
+         return matches[0]
+ 
+@@ -105,6 +109,7 @@ def check_stock(
+                 f"Shortage: {result.shortage_quantity}"
+             )
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error checking stock: {e}"
+     finally:
+         session.close()
+@@ -131,20 +136,21 @@ def update_inventory(
+         if normalized_reason not in valid_reasons:
+             normalized_reason = "restock" if change_quantity > 0 else "manual_adjustment"
+ 
+-        old_quantity = product.stock_quantity
+-        service.update_inventory(
++        change = service.update_inventory(
+             product_id=product.id,
+             change_quantity=change_quantity,
+             reason=normalized_reason,
+         )
+         session.commit()
+-        new_quantity = old_quantity + change_quantity
++        new_quantity = change.resulting_balance
++        old_quantity = new_quantity - change_quantity
+         action_verb = "Added" if change_quantity > 0 else "Deducted"
+         return (
+             f"✓ Successfully {action_verb.lower()} {abs(change_quantity)} units for '{product.name}' (SKU: {product.sku}).\n"
+             f"  Previous stock: {old_quantity} | New stock: {new_quantity} | Reason: {normalized_reason}"
+         )
+     except Exception as e:
++        logger.exception('Operation failed')
+         session.rollback()
+         return f"Error updating inventory: {e}"
+     finally:
+@@ -166,16 +172,24 @@ def check_fulfillment_feasibility(
+     service, session = _make_inventory_service()
+     try:
+         item_list = json.loads(items)
++        if not isinstance(item_list, list) or not item_list:
++            raise ValueError("Provide a nonempty list of product quantities.")
+         lines = ["Fulfillment feasibility check:"]
+         all_feasible = True
++        demands = {}
+         for item in item_list:
+             raw_id = item.get("product_id") or item.get("sku") or item.get("product")
+-            qty = int(item.get("quantity", 0))
++            qty = item.get("quantity", 0)
++            if isinstance(qty, bool) or not isinstance(qty, int) or qty <= 0:
++                raise ValueError("Quantities must be positive whole numbers.")
+             product = _find_product(service.product_repository, raw_id)
+             if product is None:
+                 lines.append(f"  ✗ Product '{raw_id}': NOT FOUND")
+                 all_feasible = False
+                 continue
++            previous = demands.get(product.id, (product, 0))[1]
++            demands[product.id] = (product, previous + qty)
++        for product, qty in demands.values():
+             from backend.app.services.inventory_service import check_fulfillment_feasibility as cff
+             result = cff(available_quantity=product.stock_quantity, requested_quantity=qty)
+             if result.feasible:
+@@ -189,6 +203,7 @@ def check_fulfillment_feasibility(
+         lines.append(f"\nOverall: {'FEASIBLE ✓' if all_feasible else 'NOT FEASIBLE ✗'}")
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error checking fulfillment feasibility: {e}"
+     finally:
+         session.close()
+@@ -214,6 +229,7 @@ def get_low_stock_products() -> str:
+             )
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error retrieving low-stock list: {e}"
+     finally:
+         session.close()
+@@ -239,6 +255,7 @@ def get_all_products() -> str:
+             )
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error retrieving product catalog: {e}"
+     finally:
+-        session.close()
+\ No newline at end of file
++        session.close()
+diff --git a/agents/tools/invoice_tools.py b/agents/tools/invoice_tools.py
+index 538e493..546bc63 100644
+--- a/agents/tools/invoice_tools.py
++++ b/agents/tools/invoice_tools.py
+@@ -1,3 +1,5 @@
++import logging
++logger = logging.getLogger(__name__)
+ '''
+ what the file does?
+ This module provides LangChain-compatible invoice and billing tools for the operations agent, wrapping InvoiceService to query invoice details, list overdue customer invoices, and compute days overdue.
+@@ -13,18 +15,19 @@ Methods:
+ '''
+ 
+ from datetime import date
+-from decimal import Decimal
++
+ from typing import Annotated
+ from uuid import UUID
+ 
+ from langchain_core.tools import tool
+ from sqlalchemy import select
++from sqlalchemy.orm import selectinload
+ 
+ from backend.app.db.database import SessionLocal
+ from backend.app.db.models.invoice import Invoice
+ from backend.app.db.repositories.invoice_repository import InvoiceRepository
+ from backend.app.db.repositories.payment_repository import PaymentRepository
+-from backend.app.services.invoice_service import InvoiceService, calculate_days_overdue
++from backend.app.services.invoice_service import InvoiceService, calculate_days_overdue, outstanding_balance, calculate_total_paid
+ 
+ 
+ def _make_invoice_service() -> tuple[InvoiceService, object]:
+@@ -46,12 +49,14 @@ def get_invoice(
+     """
+     service, session = _make_invoice_service()
+     try:
+-        invoice = service.get_invoice(UUID(invoice_id))
++        invoice = service.get_invoice(invoice_id)
+         days_overdue = calculate_days_overdue(invoice.due_date, date.today())
+         lines = [
+             f"Invoice: {invoice.invoice_id}",
++            f"  UUID: {invoice.id}",
+             f"  Status: {invoice.status}",
+             f"  Amount: ${invoice.amount}",
++            f"  Paid: ${calculate_total_paid(invoice.payments)} | Outstanding: ${outstanding_balance(invoice)}",
+             f"  Issue date: {invoice.issue_date}",
+             f"  Due date: {invoice.due_date}",
+         ]
+@@ -65,6 +70,7 @@ def get_invoice(
+                 lines.append(f"    - ${p.amount} via {p.method or 'unknown'} on {p.paid_at.date()}")
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error retrieving invoice: {e}"
+     finally:
+         session.close()
+@@ -87,6 +93,7 @@ def find_overdue_invoices(
+         today = date.today()
+         stmt = (
+             select(Invoice)
++            .options(selectinload(Invoice.payments))
+             .where(Invoice.status.in_(["sent", "partially_paid", "overdue"]))
+             .where(Invoice.due_date < today)
+             .order_by(Invoice.due_date)
+@@ -101,14 +108,17 @@ def find_overdue_invoices(
+ 
+         lines = [f"Overdue invoices ({len(invoices)}):"]
+         for inv in invoices:
++            if outstanding_balance(inv) <= 0:
++                continue
+             days = calculate_days_overdue(inv.due_date, today)
+             lines.append(
+-                f"  - {inv.invoice_id} | Customer: {inv.customer_id} | "
+-                f"Amount: ${inv.amount} | Due: {inv.due_date} | "
++                f"  - {inv.invoice_id} | UUID: {inv.id} | Customer: {inv.customer_id} | "
++                f"Outstanding: ${outstanding_balance(inv)} | Due: {inv.due_date} | "
+                 f"Days overdue: {days}"
+             )
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error finding overdue invoices: {e}"
+     finally:
+         session.close()
+@@ -126,12 +136,13 @@ def get_days_overdue(
+     """
+     service, session = _make_invoice_service()
+     try:
+-        days = service.get_days_overdue(UUID(invoice_id), date.today())
+-        invoice = service.get_invoice(UUID(invoice_id))
++        invoice = service.get_invoice(invoice_id)
++        days = calculate_days_overdue(invoice.due_date, date.today()) if invoice.status not in {"paid", "cancelled", "draft"} and outstanding_balance(invoice) > 0 else 0
+         if days == 0:
+             return f"Invoice {invoice.invoice_id} is not overdue (due: {invoice.due_date})."
+         return f"Invoice {invoice.invoice_id} is {days} day(s) overdue (due: {invoice.due_date})."
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error calculating days overdue: {e}"
+     finally:
+         session.close()
+diff --git a/agents/tools/order_tools.py b/agents/tools/order_tools.py
+index 8f31196..43e7402 100644
+--- a/agents/tools/order_tools.py
++++ b/agents/tools/order_tools.py
+@@ -1,3 +1,5 @@
++import logging
++logger = logging.getLogger(__name__)
+ '''
+ what the file does?
+ This module provides LangChain-compatible order management tools for the operations agent, delegating to OrderService to retrieve order status, advance fulfillment lifecycle states, and execute order fulfillment.
+@@ -13,7 +15,7 @@ Methods:
+ '''
+ 
+ from typing import Annotated
+-from uuid import UUID
++
+ 
+ from langchain_core.tools import tool
+ 
+@@ -49,7 +51,7 @@ def get_order_status(
+     """
+     service, session = _make_order_service()
+     try:
+-        order = service.get_order(UUID(order_id))
++        order = service.get_order(order_id)
+         lines = [
+             f"Order: {order.order_number}",
+             f"  Status: {order.status}",
+@@ -67,6 +69,7 @@ def get_order_status(
+             )
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error retrieving order: {e}"
+     finally:
+         session.close()
+@@ -87,12 +90,13 @@ def update_order_status(
+     """
+     service, session = _make_order_service()
+     try:
+-        order = service.transition_status(UUID(order_id), new_status)
++        order = service.transition_status(order_id, new_status)
+         session.commit()
+         return (
+             f"✓ Order {order.order_number} status updated to '{order.status}'."
+         )
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error updating order status: {e}"
+     finally:
+         session.close()
+@@ -109,13 +113,14 @@ def fulfill_order(
+     """
+     service, session = _make_order_service()
+     try:
+-        order = service.fulfill_order(UUID(order_id))
++        order = service.fulfill_order(order_id)
+         session.commit()
+         return (
+             f"✓ Order {order.order_number} fulfilled. Status: {order.status}. "
+             f"Inventory has been updated."
+         )
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error fulfilling order: {e}"
+     finally:
+         session.close()
+diff --git a/agents/tools/policy_tools.py b/agents/tools/policy_tools.py
+index 6acf6fe..4c9414f 100644
+--- a/agents/tools/policy_tools.py
++++ b/agents/tools/policy_tools.py
+@@ -1,3 +1,5 @@
++import logging
++logger = logging.getLogger(__name__)
+ '''
+ what the file does?
+ This module provides a LangChain-compatible RAG policy search tool for the operations agent, querying embedded business policy documents and procedures to guide operational decisions (discounts, refunds, approval rules).
+@@ -13,8 +15,9 @@ from typing import Annotated
+ 
+ from langchain_core.tools import tool
+ 
+-from backend.app.core.config import settings
+-from rag.retriever import retrieve
++
++from rag.retriever import retrieve_with_session
++from backend.app.db.database import SessionLocal
+ 
+ 
+ @tool
+@@ -38,10 +41,13 @@ def search_business_policy(
+       - "Does this refund require approval?"
+       - "What is the standard payment term?"
+     """
+-    db_url = settings.DATABASE_URL
++
+ 
+     try:
+-        results = retrieve(query, db_url, top_k=top_k)
++        if not 1 <= top_k <= 20:
++            raise ValueError("top_k must be between 1 and 20.")
++        with SessionLocal() as session:
++            results = retrieve_with_session(query, session, top_k=top_k)
+         if not results:
+             return "No relevant policy found for that query."
+ 
+@@ -53,4 +59,5 @@ def search_business_policy(
+ 
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error searching policy database: {e}"
+diff --git a/agents/tools/quote_tools.py b/agents/tools/quote_tools.py
+index 6a1a556..a7e66d5 100644
+--- a/agents/tools/quote_tools.py
++++ b/agents/tools/quote_tools.py
+@@ -12,11 +12,10 @@ Methods:
+     convert_quote_to_order: Tool to convert an approved quote directly into a new customer order.
+ '''
+ 
+-import json
+-import uuid
++import logging
+ from decimal import Decimal
+ from typing import Annotated
+-from uuid import UUID
++
+ 
+ from langchain_core.tools import tool
+ 
+@@ -24,6 +23,10 @@ from backend.app.db.database import SessionLocal
+ from backend.app.db.repositories.order_repository import OrderRepository
+ from backend.app.db.repositories.quote_repository import QuoteRepository
+ from backend.app.services.quote_service import QuoteService
++from backend.app.services.authorization_service import discount_limit, check_discount_authorization
++from backend.app.services.exceptions import ApprovalRequired, ValidationError
++
++logger = logging.getLogger(__name__)
+ 
+ 
+ def _make_quote_service() -> tuple[QuoteService, object]:
+@@ -45,7 +48,7 @@ def get_quote(
+     """
+     service, session = _make_quote_service()
+     try:
+-        quote = service.quote_repository.get_with_items(UUID(quote_id))
++        quote = service.quote_repository.get_with_items(quote_id)
+         if quote is None:
+             return f"Quote {quote_id} not found."
+         lines = [
+@@ -64,6 +67,7 @@ def get_quote(
+             )
+         return "\n".join(lines)
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error retrieving quote: {e}"
+     finally:
+         session.close()
+@@ -73,10 +77,6 @@ def get_quote(
+ def apply_discount_to_quote(
+     quote_id: Annotated[str, "UUID of the quote"],
+     discount_percent: Annotated[float, "Discount percentage (0-100) to apply"],
+-    approval_threshold: Annotated[
+-        float,
+-        "Max discount % allowed without approval (10 for regular, 15 for preferred customers)",
+-    ] = 10.0,
+ ) -> str:
+     """Apply a discount percentage to a quote.
+ 
+@@ -84,17 +84,33 @@ def apply_discount_to_quote(
+     the quote status becomes 'pending_approval' — the caller MUST surface this
+     to the user and NOT proceed without approval.
+ 
+-    The approval_threshold should match the customer's tier:
+-      - Regular customers: 10%
+-      - Preferred customers: 15%
++    Customer policy limits are resolved by Python from the stored customer record.
+     """
+     service, session = _make_quote_service()
+     try:
++        existing = service.quote_repository.get_with_items(quote_id)
++        if existing is None:
++            raise ValidationError("Quote not found.")
++        service.require_editable(existing)
++        percent = Decimal(str(discount_percent))
++        if not percent.is_finite() or not Decimal("0") <= percent <= Decimal("25"):
++            raise ValidationError("Discount must be between 0 and 25 percent.")
++        if percent != percent.quantize(Decimal("0.01")):
++            raise ValidationError("Discount must have at most two decimal places.")
++        threshold = discount_limit(existing.customer)
++        decision = check_discount_authorization(percent, threshold)
++        if decision.approval_required:
++            raise ApprovalRequired("quote_discount_approval", {
++                "quote_id": str(existing.id), "discount_percent": str(percent),
++                "previous_status": existing.status,
++                "subtotal": str(existing.subtotal), "total": str(existing.total),
++            }, decision.reason)
+         quote = service.apply_discount(
+-            quote_id=UUID(quote_id),
+-            discount_percent=Decimal(str(discount_percent)),
+-            approval_threshold=Decimal(str(approval_threshold)),
++            quote_id=existing.id,
++            discount_percent=percent,
++            approval_threshold=threshold,
+         )
++        session.commit()
+         approval_note = ""
+         if quote.status == "pending_approval":
+             approval_note = (
+@@ -108,7 +124,12 @@ def apply_discount_to_quote(
+             f"  Status: {quote.status}"
+             f"{approval_note}"
+         )
++    except ApprovalRequired:
++        raise
+     except Exception as e:
++        logger.exception('Operation failed')
++        session.rollback()
++        logger.exception("Discount application failed")
+         return f"Error applying discount: {e}"
+     finally:
+         session.close()
+@@ -125,7 +146,7 @@ def convert_quote_to_order(
+     """
+     service, session = _make_quote_service()
+     try:
+-        order = service.convert_to_order(UUID(quote_id))
++        order = service.convert_to_order(quote_id)
+         session.commit()
+         return (
+             f"✓ Quote converted to order successfully.\n"
+@@ -134,6 +155,7 @@ def convert_quote_to_order(
+             f"  Total: ${order.total}"
+         )
+     except Exception as e:
++        logger.exception('Operation failed')
+         return f"Error converting quote to order: {e}"
+     finally:
+         session.close()
+diff --git a/backend/app/api/dependencies.py b/backend/app/api/dependencies.py
+index dd0a4b0..066d258 100644
+--- a/backend/app/api/dependencies.py
++++ b/backend/app/api/dependencies.py
+@@ -12,7 +12,8 @@ Methods:
+ '''
+ 
+ from typing import Generator, Optional
+-from fastapi import Header, HTTPException, status
++from fastapi import Depends, Header, HTTPException, status
++from uuid import UUID
+ from sqlalchemy.orm import Session
+ 
+ from backend.app.db.database import SessionLocal
+@@ -30,23 +31,32 @@ def get_db() -> Generator[Session, None, None]:
+ def get_current_user(
+     x_user_id: Optional[str] = Header(None, alias="X-User-Id", description="User ID"),
+     x_user_role: Optional[str] = Header("operator", alias="X-User-Role", description="User role (admin, manager, operator)"),
++    db: Session = Depends(get_db),
+ ) -> dict:
+-    """Extract authenticated user info from request headers."""
+-    return {
+-        "user_id": x_user_id or "anonymous-operator",
+-        "role": (x_user_role or "operator").lower(),
+-    }
++    """Demo identity only: validate the ID and derive roles from the database.
++
++    X-User-Id is intentionally not authentication. X-User-Role is accepted for
++    compatibility but never trusted for authorization.
++    """
++    from backend.app.db.models.user import User
++    try:
++        user = db.get(User, UUID(x_user_id or ""))
++    except (ValueError, TypeError):
++        user = None
++    if user is None or not user.is_active:
++        raise HTTPException(status_code=401, detail="Provide X-User-Id for an active demo user.")
++    identity = {"user_id": str(user.id), "role": user.role}
++    db.rollback()  # release the read transaction before any long-running agent work
++    return identity
+ 
+ 
+ def require_role(allowed_roles: list[str]):
+     """Enforce endpoint access control based on user role."""
+-    def role_checker(current_user: dict = Header(None)) -> dict:
+-        user = current_user or {"role": "operator"}
+-        role = user.get("role", "operator")
+-        if role not in allowed_roles:
++    def role_checker(current_user: dict = Depends(get_current_user)) -> dict:
++        if current_user["role"] not in allowed_roles:
+             raise HTTPException(
+                 status_code=status.HTTP_403_FORBIDDEN,
+-                detail=f"Access forbidden: role '{role}' is not in allowed roles {allowed_roles}.",
++                detail="An active authorized user is required.",
+             )
+-        return user
++        return current_user
+     return role_checker
+diff --git a/backend/app/api/routes/approvals.py b/backend/app/api/routes/approvals.py
+index e9f6290..58b1510 100644
+--- a/backend/app/api/routes/approvals.py
++++ b/backend/app/api/routes/approvals.py
+@@ -10,10 +10,10 @@ Methods:
+ '''
+ 
+ from uuid import UUID
+-from fastapi import APIRouter, Depends, HTTPException, status
++from fastapi import APIRouter, Depends, HTTPException
+ from sqlalchemy.orm import Session
+ 
+-from backend.app.api.dependencies import get_db, get_current_user
++from backend.app.api.dependencies import get_db, get_current_user, require_role
+ from backend.app.schemas.approval import ApprovalResponse, ApprovalDecisionRequest
+ from backend.app.schemas.chat import ChatResponse
+ from backend.app.services.approval_service import ApprovalService
+@@ -22,6 +22,13 @@ from agents.agent_service import resume_agent
+ router = APIRouter(prefix="/approvals", tags=["Approvals"])
+ 
+ 
++def _resume(**kwargs):
++    try:
++        return resume_agent(**kwargs)
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
++
++
+ @router.get("", response_model=list[ApprovalResponse])
+ def list_pending_approvals(
+     db: Session = Depends(get_db),
+@@ -51,7 +58,7 @@ def approve_action(
+     approval_id: UUID,
+     req: ApprovalDecisionRequest = ApprovalDecisionRequest(),
+     db: Session = Depends(get_db),
+-    current_user: dict = Depends(get_current_user),
++    current_user: dict = Depends(require_role(["manager", "admin"])),
+ ):
+     """Approve a pending action and resume the agent graph to finalize it."""
+     service = ApprovalService(db)
+@@ -59,22 +66,18 @@ def approve_action(
+     if not approval:
+         raise HTTPException(status_code=404, detail="Approval request not found.")
+ 
+-    if approval.status != "pending":
++    if approval.status not in {"pending", "approved"}:
+         raise HTTPException(
+             status_code=400,
+             detail=f"Approval request is already resolved with status '{approval.status}'.",
+         )
+ 
+-    service.approve(
+-        approval_id,
+-        approved_by=req.approved_by or current_user.get("user_id"),
+-    )
+-
+-    res = resume_agent(
++    db.rollback()  # resume opens its own short business transactions
++    res = _resume(
+         approval_id=str(approval_id),
+         approved=True,
+         comment=req.comment,
+-        reviewer_id=req.approved_by or current_user.get("user_id"),
++        reviewer_id=current_user["user_id"],
+     )
+ 
+     return ChatResponse(
+@@ -96,7 +99,7 @@ def reject_action(
+     approval_id: UUID,
+     req: ApprovalDecisionRequest = ApprovalDecisionRequest(),
+     db: Session = Depends(get_db),
+-    current_user: dict = Depends(get_current_user),
++    current_user: dict = Depends(require_role(["manager", "admin"])),
+ ):
+     """Reject a pending action and resume the agent graph with rejection."""
+     service = ApprovalService(db)
+@@ -104,22 +107,18 @@ def reject_action(
+     if not approval:
+         raise HTTPException(status_code=404, detail="Approval request not found.")
+ 
+-    if approval.status != "pending":
++    if approval.status not in {"pending", "rejected"}:
+         raise HTTPException(
+             status_code=400,
+             detail=f"Approval request is already resolved with status '{approval.status}'.",
+         )
+ 
+-    service.reject(
+-        approval_id,
+-        approved_by=req.approved_by or current_user.get("user_id"),
+-    )
+-
+-    res = resume_agent(
++    db.rollback()
++    res = _resume(
+         approval_id=str(approval_id),
+         approved=False,
+         comment=req.comment,
+-        reviewer_id=req.approved_by or current_user.get("user_id"),
++        reviewer_id=current_user["user_id"],
+     )
+ 
+     return ChatResponse(
+diff --git a/backend/app/api/routes/chat.py b/backend/app/api/routes/chat.py
+index b6391c2..8cc84f3 100644
+--- a/backend/app/api/routes/chat.py
++++ b/backend/app/api/routes/chat.py
+@@ -6,7 +6,7 @@ Methods:
+     post_chat: POST endpoint that takes a user message, executes the LangGraph agent workflow via run_agent, and returns the agent's response, detected intent, extracted entities, and any pending approval state.
+ '''
+ 
+-from fastapi import APIRouter, Depends
++from fastapi import APIRouter, Depends, HTTPException
+ from backend.app.schemas.chat import ChatRequest, ChatResponse
+ from backend.app.api.dependencies import get_current_user
+ from agents.agent_service import run_agent
+@@ -20,12 +20,12 @@ def post_chat(
+     current_user: dict = Depends(get_current_user),
+ ) -> ChatResponse:
+     """Send a prompt or operational request to the operations agent."""
+-    result = run_agent(
+-        user_input=req.message,
+-        conversation_id=req.conversation_id or req.thread_id,
+-        thread_id=req.thread_id,
+-        conversation_history=req.conversation_history or [],
+-    )
++    try:
++        result = run_agent(
++            user_input=req.message, conversation_id=req.conversation_id or req.thread_id,
++            thread_id=req.thread_id, conversation_history=req.conversation_history or [])
++    except ValueError as exc:
++        raise HTTPException(status_code=409, detail=str(exc)) from exc
+     return ChatResponse(
+         response=result.get("response", ""),
+         workflow=result.get("workflow"),
+diff --git a/backend/app/api/routes/customers.py b/backend/app/api/routes/customers.py
+index 0240b13..7dbb1af 100644
+--- a/backend/app/api/routes/customers.py
++++ b/backend/app/api/routes/customers.py
+@@ -8,7 +8,8 @@ Methods:
+ '''
+ 
+ from uuid import UUID
+-from fastapi import APIRouter, Depends, HTTPException
++from fastapi import APIRouter, Depends, HTTPException, Query
++from backend.app.services.authorization_service import customer_tier
+ from sqlalchemy.orm import Session
+ 
+ from backend.app.api.dependencies import get_db, get_current_user
+@@ -20,13 +21,13 @@ router = APIRouter(prefix="/customers", tags=["Customers"])
+ @router.get("")
+ def list_customers(
+     query: str | None = None,
+-    limit: int = 50,
++    limit: int = Query(50, ge=1, le=500),
+     db: Session = Depends(get_db),
+     current_user: dict = Depends(get_current_user),
+ ):
+     """Search or list customers."""
+     repo = CustomerRepository(db)
+-    customers = repo.search(query) if query else repo.list_all(limit=limit)
++    customers = repo.search(query, limit=limit) if query else repo.list_all(limit=limit)
+ 
+     return [
+         {
+@@ -34,7 +35,7 @@ def list_customers(
+             "name": c.name,
+             "email": c.email,
+             "company_name": c.company_name,
+-            "tier": getattr(c, "tier", "regular"),
++            "tier": customer_tier(c),
+         }
+         for c in customers
+     ]
+@@ -56,5 +57,5 @@ def get_customer(
+         "name": customer.name,
+         "email": customer.email,
+         "company_name": customer.company_name,
+-        "tier": getattr(customer, "tier", "regular"),
+-    }
+\ No newline at end of file
++        "tier": customer_tier(customer),
++    }
+diff --git a/backend/app/api/routes/invoices.py b/backend/app/api/routes/invoices.py
+index 11258d6..d0f87f1 100644
+--- a/backend/app/api/routes/invoices.py
++++ b/backend/app/api/routes/invoices.py
+@@ -10,12 +10,15 @@ Methods:
+     send_invoice_reminder: POST endpoint that creates a follow-up task and runs the agent to draft and log an overdue payment notice.
+ '''
+ 
+-from datetime import datetime, timezone
++from datetime import date, datetime, timezone
++import logging
+ from typing import Optional
+ from uuid import UUID
+ from fastapi import APIRouter, Depends, HTTPException, Query
+ from sqlalchemy import or_, select
+-from sqlalchemy.orm import Session, joinedload
++from sqlalchemy.orm import Session, joinedload, selectinload
++from backend.app.services.invoice_service import outstanding_balance
++from backend.app.services.execution_service import require_logged_communication
+ 
+ from backend.app.api.dependencies import get_db, get_current_user
+ from backend.app.db.models.invoice import Invoice
+@@ -23,6 +26,7 @@ from backend.app.db.repositories.followup_repository import FollowupRepository
+ from agents.agent_service import run_agent
+ 
+ router = APIRouter(prefix="/invoices", tags=["Invoices"])
++logger = logging.getLogger(__name__)
+ 
+ 
+ def _format_invoice(inv: Invoice) -> dict:
+@@ -34,7 +38,7 @@ def _format_invoice(inv: Invoice) -> dict:
+         "customer_name": inv.customer.name if inv.customer else "Customer",
+         "total": float(inv.amount),
+         "amount": float(inv.amount),
+-        "amount_due": float(inv.amount) if inv.status != "paid" else 0.0,
++        "amount_due": float(outstanding_balance(inv)),
+         "due_date": inv.due_date.isoformat() if inv.due_date else None,
+         "issue_date": inv.issue_date.isoformat() if inv.issue_date else None,
+         "status": inv.status,
+@@ -49,7 +53,9 @@ def list_invoices(
+     current_user: dict = Depends(get_current_user),
+ ):
+     """List all invoices, optionally filtered by status."""
+-    stmt = select(Invoice).options(joinedload(Invoice.customer)).order_by(Invoice.issue_date.desc())
++    if status and status not in {"all", "draft", "sent", "partially_paid", "paid", "overdue", "cancelled"}:
++        raise HTTPException(status_code=422, detail="Invalid invoice status.")
++    stmt = select(Invoice).options(joinedload(Invoice.customer), selectinload(Invoice.payments)).order_by(Invoice.issue_date.desc())
+     if status and status != "all":
+         stmt = stmt.where(Invoice.status == status)
+     invoices = db.scalars(stmt).all()
+@@ -65,14 +71,14 @@ def list_overdue_invoices(
+     """Retrieve all overdue invoices, optionally filtered by customer."""
+     stmt = (
+         select(Invoice)
+-        .options(joinedload(Invoice.customer))
+-        .where(Invoice.status == "overdue")
++        .options(joinedload(Invoice.customer), selectinload(Invoice.payments))
++        .where(Invoice.status.in_(["sent", "partially_paid", "overdue"]), Invoice.due_date < date.today())
+         .order_by(Invoice.due_date.asc())
+     )
+     if customer_id:
+         stmt = stmt.where(Invoice.customer_id == customer_id)
+     overdue = db.scalars(stmt).all()
+-    return [_format_invoice(inv) for inv in overdue]
++    return [_format_invoice(inv) for inv in overdue if outstanding_balance(inv) > 0]
+ 
+ 
+ @router.get("/{invoice_id}")
+@@ -82,7 +88,7 @@ def get_invoice(
+     current_user: dict = Depends(get_current_user),
+ ):
+     """Retrieve details for a specific invoice by UUID or invoice_id."""
+-    stmt = select(Invoice).options(joinedload(Invoice.customer))
++    stmt = select(Invoice).options(joinedload(Invoice.customer), selectinload(Invoice.payments))
+     try:
+         inv_uuid = UUID(invoice_id)
+         stmt = stmt.where(or_(Invoice.id == inv_uuid, Invoice.invoice_id == invoice_id))
+@@ -103,7 +109,7 @@ def send_invoice_reminder(
+     current_user: dict = Depends(get_current_user),
+ ):
+     """Dispatch an autonomous reminder task for an overdue invoice."""
+-    stmt = select(Invoice).options(joinedload(Invoice.customer))
++    stmt = select(Invoice).options(joinedload(Invoice.customer), selectinload(Invoice.payments))
+     try:
+         inv_uuid = UUID(invoice_id)
+         stmt = stmt.where(or_(Invoice.id == inv_uuid, Invoice.invoice_id == invoice_id))
+@@ -114,29 +120,42 @@ def send_invoice_reminder(
+     if not invoice:
+         raise HTTPException(status_code=404, detail="Invoice not found.")
+ 
++    balance = outstanding_balance(invoice)
++    if invoice.status not in {"sent", "partially_paid", "overdue"} or invoice.due_date >= date.today() or balance <= 0:
++        raise HTTPException(status_code=409, detail="Only unpaid overdue invoices can receive an overdue reminder.")
++    target_id, customer_id, number = invoice.id, invoice.customer_id, invoice.invoice_id
+     repo = FollowupRepository(db)
+     task = repo.create(
+         task_type="overdue_invoice",
+         scheduled_at=datetime.now(timezone.utc),
+         customer_id=invoice.customer_id,
++        status="in_progress",
+     )
+     # Trigger autonomous agent reminder
+     cust_name = invoice.customer.name if invoice.customer else "the customer"
+     prompt = (
+-        f"Overdue invoice reminder: Please draft and send an overdue payment notice "
+-        f"for invoice {invoice.invoice_id} to {cust_name} for outstanding balance ${float(invoice.amount):.2f}."
++        f"Overdue invoice reminder: draft and log an outbound email (do not send) "
++        f"for invoice {number} (UUID {target_id}) to customer {cust_name} (UUID {customer_id}). "
++        f"Outstanding balance is ${balance:.2f}. Link the communication to related_entity_type invoice and related_entity_id {target_id}."
+     )
++    task_id = task.id
++    db.rollback()  # release read transactions before the LLM/tool work
++    success = False
+     try:
+         agent_res = run_agent(user_input=prompt)
+-        repo.mark_completed(task.id)
+-        response_text = agent_res.get("response", "Reminder dispatched.")
++        require_logged_communication(agent_res, db, customer_id, "invoice", target_id)
++        repo.mark_completed(task_id)
++        success = True
++        response_text = "Reminder draft recorded; no email was sent."
+     except Exception as e:
+-        repo.mark_failed(task.id, error=str(e))
+-        response_text = "Follow-up task queued for execution."
++        db.rollback()
++        logger.exception("Invoice reminder failed")
++        repo.mark_failed(task_id, error=str(e))
++        response_text = f"Reminder failed: {e}"
+ 
+     return {
+-        "success": True,
+-        "message": f"Reminder sent for {invoice.invoice_id}: {response_text}",
+-        "invoice_id": invoice.invoice_id,
+-        "task_id": str(task.id),
++        "success": success,
++        "message": f"{number}: {response_text}",
++        "invoice_id": number,
++        "task_id": str(task_id),
+     }
+diff --git a/backend/app/api/routes/orders.py b/backend/app/api/routes/orders.py
+index 54acd5a..f6189e2 100644
+--- a/backend/app/api/routes/orders.py
++++ b/backend/app/api/routes/orders.py
+@@ -39,6 +39,8 @@ def list_orders(
+     current_user: dict = Depends(get_current_user),
+ ):
+     """List all orders, optionally filtered by status."""
++    if status and status not in {"all", "pending", "processing", "shipped", "delivered", "cancelled"}:
++        raise HTTPException(status_code=422, detail="Invalid order status.")
+     stmt = select(Order).options(joinedload(Order.customer)).order_by(Order.created_at.desc())
+     if status and status != "all":
+         stmt = stmt.where(Order.status == status)
+@@ -58,4 +60,4 @@ def get_order(
+     if not order:
+         raise HTTPException(status_code=404, detail="Order not found.")
+ 
+-    return _format_order(order)
+\ No newline at end of file
++    return _format_order(order)
+diff --git a/backend/app/api/routes/products.py b/backend/app/api/routes/products.py
+index 881d9ae..c830117 100644
+--- a/backend/app/api/routes/products.py
++++ b/backend/app/api/routes/products.py
+@@ -7,13 +7,13 @@ Methods:
+     get_low_stock_products: GET endpoint to query products whose current stock is at or below their reorder point.
+ '''
+ 
+-from uuid import UUID
+-from fastapi import APIRouter, Depends, HTTPException
++
++from fastapi import APIRouter, Depends
+ from sqlalchemy.orm import Session
+ 
+ from backend.app.api.dependencies import get_db, get_current_user
+ from backend.app.db.repositories.product_repository import ProductRepository
+-from backend.app.db.repositories.inventory_repository import InventoryRepository
++
+ 
+ router = APIRouter(prefix="/products", tags=["Products & Inventory"])
+ 
+@@ -26,7 +26,7 @@ def list_products(
+     """List all products with stock information."""
+     prod_repo = ProductRepository(db)
+ 
+-    products = prod_repo.list_all() if hasattr(prod_repo, "list_all") else []
++    products = prod_repo.list_all()
+     results = []
+     for p in products:
+         results.append({
+@@ -51,7 +51,7 @@ def get_low_stock_products(
+ ):
+     """List products that are at or below their reorder point."""
+     prod_repo = ProductRepository(db)
+-    low_stock = prod_repo.list_low_stock() if hasattr(prod_repo, "list_low_stock") else []
++    low_stock = prod_repo.list_low_stock()
+     return [
+         {
+             "product_id": str(p.id),
+diff --git a/backend/app/api/routes/quotes.py b/backend/app/api/routes/quotes.py
+index ea02bc5..957d4fb 100644
+--- a/backend/app/api/routes/quotes.py
++++ b/backend/app/api/routes/quotes.py
+@@ -24,6 +24,8 @@ def list_quotes(
+     current_user: dict = Depends(get_current_user),
+ ):
+     """List all quotations, optionally filtered by status."""
++    if status and status not in {"all", "draft", "pending_approval", "approved", "rejected", "converted", "expired"}:
++        raise HTTPException(status_code=422, detail="Invalid quote status.")
+     repo = QuoteRepository(db)
+     quotes = repo.list_all(status=status)
+     return [
+@@ -69,6 +71,9 @@ def get_quote(
+         "id": str(quote.id),
+         "quote_number": quote.quote_number,
+         "customer_id": str(quote.customer_id),
++        "customer_name": quote.customer.name if quote.customer else None,
++        "approval_id": str(quote.approval_id) if quote.approval_id else None,
++        "created_at": quote.created_at.isoformat() if quote.created_at else None,
+         "status": quote.status,
+         "subtotal": float(quote.subtotal) if quote.subtotal else 0.0,
+         "discount_percent": float(quote.discount_percent) if quote.discount_percent else 0.0,
+diff --git a/backend/app/api/routes/tasks.py b/backend/app/api/routes/tasks.py
+index c6e685a..118a04a 100644
+--- a/backend/app/api/routes/tasks.py
++++ b/backend/app/api/routes/tasks.py
+@@ -8,7 +8,7 @@ Methods:
+     trigger_due_tasks: POST endpoint that manually triggers the execution of all currently due background follow-up tasks.
+ '''
+ 
+-from uuid import UUID
++
+ from fastapi import APIRouter, Depends, HTTPException
+ from sqlalchemy.orm import Session
+ 
+@@ -16,6 +16,8 @@ from backend.app.api.dependencies import get_db, get_current_user
+ from backend.app.schemas.task import CreateTaskRequest, TaskResponse
+ from backend.app.db.repositories.followup_repository import FollowupRepository
+ from backend.app.scheduler.jobs import process_due_followups
++from backend.app.services.followup_service import create_followup
++from backend.app.services.exceptions import ValidationError, NotFoundError
+ 
+ router = APIRouter(prefix="/tasks", tags=["Tasks"])
+ 
+@@ -55,31 +57,12 @@ def create_task(
+     current_user: dict = Depends(get_current_user),
+ ):
+     """Create a new follow-up task scheduled for a future time."""
+-    repo = FollowupRepository(db)
+-
+-    cust_id = None
+-    if req.customer_id:
+-        try:
+-            cust_id = UUID(str(req.customer_id))
+-        except ValueError:
+-            from backend.app.db.models.customer import Customer
+-            first_c = db.query(Customer).first()
+-            if first_c:
+-                cust_id = first_c.id
+-
+-    quote_id = None
+-    if req.quote_id:
+-        try:
+-            quote_id = UUID(str(req.quote_id))
+-        except ValueError:
+-            pass
+-
+-    task = repo.create(
+-        task_type=req.task_type,
+-        scheduled_at=req.scheduled_at,
+-        customer_id=cust_id,
+-        quote_id=quote_id,
+-    )
++    try:
++        task = create_followup(db, req.task_type, req.scheduled_at, req.customer_id, req.quote_id)
++    except NotFoundError as exc:
++        raise HTTPException(status_code=404, detail=str(exc)) from exc
++    except ValidationError as exc:
++        raise HTTPException(status_code=422, detail=str(exc)) from exc
+     return TaskResponse(
+         id=task.id,
+         task_type=task.task_type,
+diff --git a/backend/app/core/audit.py b/backend/app/core/audit.py
+index 39a1de0..853b45a 100644
+--- a/backend/app/core/audit.py
++++ b/backend/app/core/audit.py
+@@ -13,7 +13,10 @@ Methods:
+ import logging
+ from datetime import datetime, timezone
+ from typing import Any, Callable, Optional
+-from uuid import UUID, uuid4
++from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
++from inspect import signature
++from langchain_core.runnables import RunnableConfig
++from langgraph.errors import GraphInterrupt
+ 
+ from backend.app.db.database import SessionLocal
+ from backend.app.db.models.audit_log import AuditLog
+@@ -69,16 +72,18 @@ def record_audit_log(
+             db.commit()
+             return log_entry.id
+     except Exception as exc:
+-        logger.debug(f"Audit log recording skipped (DB unavailable or error): {exc}")
++        logger.exception("Audit log recording failed")
+         return None
+ 
+ 
+ def audit_node(node_name: str):
+     """Decorator for wrapping LangGraph nodes to automatically capture audit logs."""
+     def decorator(fn: Callable):
+-        def wrapper(state: dict, *args, **kwargs) -> dict:
+-            run_id = state.get("request_id")
+-            conv_id = state.get("conversation_id")
++        def wrapper(state: dict, config: RunnableConfig) -> dict:
++            request_id = state.get("request_id")
++            run_id = uuid5(NAMESPACE_URL, "officehub:run:" + request_id) if request_id else None
++            # Conversation IDs are checkpoint keys and need not reference an ORM conversation.
++            conv_id = None
+             input_summary = {
+                 "workflow": state.get("workflow"),
+                 "intent": state.get("intent"),
+@@ -86,7 +91,7 @@ def audit_node(node_name: str):
+             }
+ 
+             try:
+-                result = fn(state, *args, **kwargs)
++                result = fn(state, config) if "config" in signature(fn).parameters else fn(state)
+                 record_audit_log(
+                     node=node_name,
+                     action=state.get("workflow") or node_name,
+@@ -103,6 +108,10 @@ def audit_node(node_name: str):
+                     conversation_id=conv_id,
+                 )
+                 return result
++            except GraphInterrupt:
++                record_audit_log(node=node_name, run_id=run_id, action="waiting_approval",
++                                 approval_status="pending", input_data=input_summary)
++                raise
+             except Exception as exc:
+                 record_audit_log(
+                     node=node_name,
+@@ -112,6 +121,6 @@ def audit_node(node_name: str):
+                     run_id=run_id,
+                     conversation_id=conv_id,
+                 )
+-                raise exc
++                raise
+         return wrapper
+     return decorator
+diff --git a/backend/app/db/models/followup_task.py b/backend/app/db/models/followup_task.py
+index 584a56e..68f540a 100644
+--- a/backend/app/db/models/followup_task.py
++++ b/backend/app/db/models/followup_task.py
+@@ -79,6 +79,8 @@ class FollowupTask(Base):
+         nullable=True,
+     )
+ 
++    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
++
+     created_at: Mapped[datetime] = mapped_column(
+         DateTime(timezone=True),
+         nullable=False,
+@@ -87,4 +89,4 @@ class FollowupTask(Base):
+ 
+     customer: Mapped["Customer | None"] = relationship()
+ 
+-    quote: Mapped["Quote | None"] = relationship()
+\ No newline at end of file
++    quote: Mapped["Quote | None"] = relationship()
+diff --git a/backend/app/db/repositories/approval_repository.py b/backend/app/db/repositories/approval_repository.py
+index 354e317..56220f2 100644
+--- a/backend/app/db/repositories/approval_repository.py
++++ b/backend/app/db/repositories/approval_repository.py
+@@ -83,9 +83,14 @@ class ApprovalRepository:
+         approved_by: Optional[UUID | str] = None,
+     ) -> Optional[ApprovalRequest]:
+         """Resolve an approval request (approved or rejected)."""
+-        approval = self.get_by_id(approval_id)
++        approval = self.session.scalars(select(ApprovalRequest).where(
++            ApprovalRequest.id == UUID(str(approval_id))).with_for_update()).one_or_none()
+         if not approval:
+             return None
++        if status not in {"approved", "rejected"}:
++            raise ValueError("Invalid approval decision.")
++        if approval.status not in {"pending", status}:
++            raise ValueError("Approval already has a different decision.")
+ 
+         # Safely convert approved_by to a valid User UUID if exists, else None
+         user_uuid: Optional[UUID] = None
+@@ -103,19 +108,19 @@ class ApprovalRepository:
+                 if not self.session.get(User, user_uuid):
+                     user_uuid = None
+ 
++        if user_uuid is None:
++            raise ValueError("An existing manager identity is required.")
++        reviewer = self.session.get(User, user_uuid)
++        if not reviewer.is_active or reviewer.role not in {"manager", "admin"}:
++            raise ValueError("An active manager or admin is required.")
++        if approval.status == status:
++            return approval
+         approval.status = status
+         approval.approved_by = user_uuid
+         approval.resolved_at = datetime.now(timezone.utc)
+ 
+-        # Synchronize linked Quotes status to match approval resolution
+-        from backend.app.db.models.quote import Quote
+-        linked_quotes = self.session.query(Quote).filter(Quote.approval_id == approval.id).all()
+-        for q in linked_quotes:
+-            if status == "approved":
+-                q.status = "approved"
+-            elif status == "rejected":
+-                q.status = "rejected"
+-
++        # The resumed workflow executes the saved proposal; a decision alone is
++        # not proof that the business mutation completed.
+         self.session.commit()
+         self.session.refresh(approval)
+         return approval
+diff --git a/backend/app/db/repositories/communication_repository.py b/backend/app/db/repositories/communication_repository.py
+index 45216f8..e385997 100644
+--- a/backend/app/db/repositories/communication_repository.py
++++ b/backend/app/db/repositories/communication_repository.py
+@@ -26,6 +26,7 @@ class CommunicationRepository:
+         communication_type: str | None = None,
+         direction: str | None = None,
+         status: str | None = None,
++        limit: int | None = None,
+     ) -> list[Communication]:
+         statement = (
+             select(Communication)
+@@ -42,6 +43,8 @@ class CommunicationRepository:
+             statement = statement.where(Communication.status == status)
+ 
+         statement = statement.order_by(Communication.created_at.desc())
++        if limit is not None:
++            statement = statement.limit(limit)
+ 
+         return list(self.session.scalars(statement).all())
+ 
+@@ -75,4 +78,4 @@ class CommunicationRepository:
+     def save(self, communication: Communication) -> Communication:
+         self.session.add(communication)
+         self.session.flush()
+-        return communication
+\ No newline at end of file
++        return communication
+diff --git a/backend/app/db/repositories/customer_repository.py b/backend/app/db/repositories/customer_repository.py
+index de5ca05..0a41d11 100644
+--- a/backend/app/db/repositories/customer_repository.py
++++ b/backend/app/db/repositories/customer_repository.py
+@@ -23,7 +23,7 @@ class CustomerRepository:
+         statement = select(Customer).order_by(Customer.name).limit(limit)
+         return list(self.session.scalars(statement).all())
+ 
+-    def search(self, query: str) -> list[Customer]:
++    def search(self, query: str, limit: int | None = None) -> list[Customer]:
+         statement = (
+             select(Customer)
+             .where(
+@@ -36,7 +36,9 @@ class CustomerRepository:
+             .order_by(Customer.name)
+         )
+ 
++        if limit is not None:
++            statement = statement.limit(limit)
+         return list(self.session.scalars(statement).all())
+ 
+     def get_by_id(self, customer_id: UUID) -> Customer | None:
+-        return self.session.get(Customer, customer_id)
+\ No newline at end of file
++        return self.session.get(Customer, customer_id)
+diff --git a/backend/app/db/repositories/followup_repository.py b/backend/app/db/repositories/followup_repository.py
+index d192e24..322802f 100644
+--- a/backend/app/db/repositories/followup_repository.py
++++ b/backend/app/db/repositories/followup_repository.py
+@@ -12,11 +12,11 @@ Methods:
+     mark_failed: Marks a task as failed and records the corresponding error message.
+ '''
+ 
+-from datetime import datetime, timezone
++from datetime import datetime, timezone, timedelta
+ from typing import Optional
+ from uuid import UUID, uuid4
+-from sqlalchemy.orm import Session
+-from sqlalchemy import select
++from sqlalchemy.orm import Session, joinedload
++from sqlalchemy import select, update, or_
+ 
+ from backend.app.db.models.followup_task import FollowupTask
+ 
+@@ -33,6 +33,7 @@ class FollowupRepository:
+         scheduled_at: datetime,
+         customer_id: Optional[UUID] = None,
+         quote_id: Optional[UUID] = None,
++        status: str = "pending",
+     ) -> FollowupTask:
+         """Create a new follow-up task."""
+         task = FollowupTask(
+@@ -41,8 +42,9 @@ class FollowupRepository:
+             scheduled_at=scheduled_at,
+             customer_id=customer_id,
+             quote_id=quote_id,
+-            status="pending",
+-            attempt_count=0,
++            status=status,
++            attempt_count=1 if status == "in_progress" else 0,
++            started_at=datetime.now(timezone.utc) if status == "in_progress" else None,
+             created_at=datetime.now(timezone.utc),
+         )
+         self.session.add(task)
+@@ -62,6 +64,13 @@ class FollowupRepository:
+     def get_due_tasks(self, as_of: Optional[datetime] = None) -> list[FollowupTask]:
+         """Fetch all pending tasks scheduled at or before `as_of`."""
+         now_dt = as_of or datetime.now(timezone.utc)
++        # Never automatically replay work whose side effects may have happened.
++        # Stale claims are failed for explicit review instead of being requeued.
++        self.session.execute(update(FollowupTask).where(
++            FollowupTask.status == "in_progress",
++            or_(FollowupTask.started_at.is_(None), FollowupTask.started_at < now_dt - timedelta(minutes=30)),
++        ).values(status="failed", last_error="Worker did not finish within 30 minutes; review recorded communications before retrying."))
++        self.session.commit()
+         stmt = (
+             select(FollowupTask)
+             .where(
+@@ -77,18 +86,20 @@ class FollowupRepository:
+         stmt = (
+             select(FollowupTask)
+             .order_by(FollowupTask.scheduled_at.desc())
++            .options(joinedload(FollowupTask.customer))
+             .limit(limit)
+         )
+         return list(self.session.execute(stmt).scalars().all())
+ 
+     def mark_in_progress(self, task_id: UUID | str) -> Optional[FollowupTask]:
+         """Mark task as currently in progress."""
+-        task = self.get_by_id(task_id)
+-        if not task:
+-            return None
+-        task.status = "in_progress"
+-        task.attempt_count += 1
++        task = self.session.scalars(update(FollowupTask).where(
++            FollowupTask.id == UUID(str(task_id)), FollowupTask.status == "pending"
++        ).values(status="in_progress", attempt_count=FollowupTask.attempt_count + 1, started_at=datetime.now(timezone.utc))
++          .returning(FollowupTask)).one_or_none()
+         self.session.commit()
++        if task is None:
++            return None
+         self.session.refresh(task)
+         return task
+ 
+diff --git a/backend/app/db/repositories/invoice_repository.py b/backend/app/db/repositories/invoice_repository.py
+index 0da3d2f..ca53bcf 100644
+--- a/backend/app/db/repositories/invoice_repository.py
++++ b/backend/app/db/repositories/invoice_repository.py
+@@ -35,10 +35,15 @@ class InvoiceRepository:
+         return result
+ 
+     def get_with_payments(self, invoice_id: UUID) -> Invoice | None:
++        try:
++            predicate = Invoice.id == UUID(str(invoice_id))
++        except ValueError:
++            predicate = Invoice.invoice_id == str(invoice_id)
+         statement = (
+             select(Invoice)
+-            .where(Invoice.id == invoice_id)
++            .where(predicate)
+             .options(selectinload(Invoice.payments))
++            .with_for_update()
+         )
+         result = self.session.scalars(statement).one_or_none()
+         return result
+@@ -46,4 +51,4 @@ class InvoiceRepository:
+     def save(self, invoice: Invoice) -> Invoice:
+         self.session.add(invoice)
+         self.session.flush()
+-        return invoice
+\ No newline at end of file
++        return invoice
+diff --git a/backend/app/db/repositories/order_repository.py b/backend/app/db/repositories/order_repository.py
+index b4d5e10..0cffe1d 100644
+--- a/backend/app/db/repositories/order_repository.py
++++ b/backend/app/db/repositories/order_repository.py
+@@ -65,12 +65,17 @@ class OrderRepository:
+         return result
+ 
+     def get_with_items(self, order_id: UUID) -> Order | None:
++        try:
++            predicate = Order.id == UUID(str(order_id))
++        except ValueError:
++            predicate = Order.order_number == str(order_id)
+         statement = (
+             select(Order)
+-            .where(Order.id == order_id)
++            .where(predicate)
+             .options(
+                 selectinload(Order.items),
+             )
++            .with_for_update()
+         )
+ 
+         result = self.session.scalars(statement).one_or_none()
+@@ -81,4 +86,4 @@ class OrderRepository:
+         self.session.add(order)
+         self.session.flush()
+ 
+-        return order
+\ No newline at end of file
++        return order
+diff --git a/backend/app/db/repositories/product_repository.py b/backend/app/db/repositories/product_repository.py
+index 2e03f65..a2ac614 100644
+--- a/backend/app/db/repositories/product_repository.py
++++ b/backend/app/db/repositories/product_repository.py
+@@ -12,7 +12,7 @@ Methods:
+ '''
+ from uuid import UUID
+ 
+-from sqlalchemy import select
++from sqlalchemy import select, func
+ from sqlalchemy.orm import Session
+ 
+ from backend.app.db.models.product import Product
+@@ -23,11 +23,13 @@ class ProductRepository:
+         self.session = session
+ 
+     def get_by_id(self, product_id: UUID) -> Product | None:
+-        return self.session.get(Product, product_id)
++        # Refresh any previously loaded instance after acquiring the stock lock.
++        return self.session.scalars(select(Product).where(Product.id == product_id)
++                                    .with_for_update().execution_options(populate_existing=True)).one_or_none()
+ 
+     def get_by_sku(self, sku: str) -> Product | None:
+-        statement = select(Product).where(Product.sku.ilike(sku.strip()))
+-        return self.session.scalars(statement).first()
++        statement = select(Product).where(func.lower(Product.sku) == sku.strip().lower())
++        return self.session.scalars(statement).one_or_none()
+ 
+     def search_by_name_or_sku(self, query: str) -> list[Product]:
+         from sqlalchemy import or_, and_
+@@ -72,4 +74,4 @@ class ProductRepository:
+     def save(self, product: Product) -> Product:
+         self.session.add(product)
+         self.session.flush()
+-        return product
+\ No newline at end of file
++        return product
+diff --git a/backend/app/db/repositories/quote_repository.py b/backend/app/db/repositories/quote_repository.py
+index 4bbb914..88c00cb 100644
+--- a/backend/app/db/repositories/quote_repository.py
++++ b/backend/app/db/repositories/quote_repository.py
+@@ -13,7 +13,7 @@ Methods:
+ from uuid import UUID
+ 
+ from sqlalchemy import select
+-from sqlalchemy.orm import Session, selectinload
++from sqlalchemy.orm import Session, selectinload, joinedload
+ 
+ from backend.app.db.models.quote import Quote
+ from backend.app.db.models.quote_item import QuoteItem
+@@ -27,16 +27,21 @@ class QuoteRepository:
+         return self.session.get(Quote, quote_id)
+ 
+     def list_all(self, status: str | None = None) -> list[Quote]:
+-        statement = select(Quote).options(selectinload(Quote.items)).order_by(Quote.created_at.desc())
++        statement = select(Quote).options(selectinload(Quote.items), joinedload(Quote.customer)).order_by(Quote.created_at.desc())
+         if status and status != "all":
+             statement = statement.where(Quote.status == status)
+         return list(self.session.scalars(statement).all())
+ 
+     def get_with_items(self, quote_id: UUID) -> Quote | None:
++        try:
++            predicate = Quote.id == UUID(str(quote_id))
++        except ValueError:
++            predicate = Quote.quote_number == str(quote_id)
+         statement = (
+             select(Quote)
+-            .where(Quote.id == quote_id)
++            .where(predicate)
+             .options(selectinload(Quote.items))
++            .with_for_update()
+         )
+         return self.session.scalars(statement).one_or_none()
+ 
+diff --git a/backend/app/scheduler/jobs.py b/backend/app/scheduler/jobs.py
+index 33fc04a..c76a919 100644
+--- a/backend/app/scheduler/jobs.py
++++ b/backend/app/scheduler/jobs.py
+@@ -1,66 +1,40 @@
+-'''
+-This module defines the background job worker routines executed periodically by APScheduler. It processes due follow-up tasks by synthesizing context-aware agent prompts, invoking the operations agent to execute the follow-ups, and recording completion or failure results.
+-Classes:
+-    None (Background job execution module).
+-Methods:
+-    process_due_followups: Queries due follow-up tasks from the database and runs the agent to execute automated collections reminders and quote follow-ups.
+-'''
+-
++"""Claim due tasks once and verify follow-up records before completion."""
+ import logging
+-from datetime import datetime, timezone
+-from typing import Optional
+-
+ from backend.app.db.database import SessionLocal
+ from backend.app.db.repositories.followup_repository import FollowupRepository
++from backend.app.services.execution_service import require_logged_communication
+ from agents.agent_service import run_agent
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ def process_due_followups() -> int:
+-    """Check for due follow-up tasks and execute them via the operations agent.
+-
+-    Returns the number of tasks processed.
+-    """
+-    logger.info("Running process_due_followups job...")
+-    processed_count = 0
+-
++    processed = 0
+     try:
+         with SessionLocal() as db:
+-            repo = FollowupRepository(db)
+-            due_tasks = repo.get_due_tasks()
+-
+-            if not due_tasks:
+-                logger.debug("No due follow-up tasks found.")
+-                return 0
+-
+-            logger.info(f"Found {len(due_tasks)} due follow-up task(s). Processing...")
+-
+-            for task in due_tasks:
+-                task_id = task.id
+-                repo.mark_in_progress(task_id)
+-
+-                # Formulate synthesized agent prompt
+-                customer_info = f"customer {task.customer_id}" if task.customer_id else "customer"
+-                quote_info = f"quote {task.quote_id}" if task.quote_id else ""
+-                prompt = (
+-                    f"Scheduled automated follow-up: Check status and log follow-up communication "
+-                    f"for {customer_info} regarding {task.task_type} {quote_info}."
+-                )
+-
++            task_ids = [task.id for task in FollowupRepository(db).get_due_tasks()]
++        for task_id in task_ids:
++            try:
++                with SessionLocal() as db:
++                    task = FollowupRepository(db).mark_in_progress(task_id)
++                    if task is None:
++                        continue  # another worker already claimed it
++                    customer_id, quote_id, task_type = task.customer_id, task.quote_id, task.task_type
++                prompt = (f'Scheduled follow-up now due: {task_type}. Customer UUID: {customer_id}. '
++                          f'Quote UUID: {quote_id or "none"}. Check the referenced business facts and log an outbound '
++                          'note or email draft. Link the quote UUID when supplied. Do not schedule another task and do not claim email delivery.')
++                result = run_agent(user_input=prompt)
++                with SessionLocal() as db:
++                    require_logged_communication(result, db, customer_id, 'quote' if quote_id else None, quote_id)
++                    FollowupRepository(db).mark_completed(task_id)
++                processed += 1
++            except Exception as exc:
++                logger.exception('Follow-up task %s failed', task_id)
+                 try:
+-                    res = run_agent(user_input=prompt)
+-                    repo.mark_completed(task_id)
+-                    processed_count += 1
+-                    logger.info(
+-                        f"Completed follow-up task {task_id}: {res.get('workflow')} - {res.get('response')[:80]}..."
+-                    )
+-                except Exception as exc:
+-                    error_msg = str(exc)
+-                    repo.mark_failed(task_id, error=error_msg)
+-                    logger.error(f"Failed executing follow-up task {task_id}: {error_msg}")
+-
+-    except Exception as exc:
+-        logger.warning(f"Database unavailable or error in process_due_followups: {exc}")
+-
+-    return processed_count
++                    with SessionLocal() as db:
++                        FollowupRepository(db).mark_failed(task_id, str(exc))
++                except Exception:
++                    logger.exception('Could not mark follow-up task %s failed; manual review needed', task_id)
++    except Exception:
++        logger.exception('Due-task sweep failed')
++    return processed
+diff --git a/backend/app/services/authorization_service.py b/backend/app/services/authorization_service.py
+index 4c32b13..366b184 100644
+--- a/backend/app/services/authorization_service.py
++++ b/backend/app/services/authorization_service.py
+@@ -9,6 +9,7 @@ Methods:
+ 
+ from dataclasses import dataclass
+ from decimal import Decimal
++import re
+ 
+ 
+ @dataclass(frozen=True)
+@@ -21,6 +22,8 @@ def check_discount_authorization(
+     discount_percent: Decimal,
+     approval_threshold: Decimal,
+ ) -> AuthorizationResult:
++    if not discount_percent.is_finite() or not approval_threshold.is_finite():
++        raise ValueError("Discount and threshold must be finite.")
+     if discount_percent < Decimal("0"):
+         raise ValueError("Discount percentage cannot be negative.")
+ 
+@@ -46,6 +49,8 @@ def check_refund_authorization(
+     refund_amount: Decimal,
+     approval_threshold: Decimal,
+ ) -> AuthorizationResult:
++    if not refund_amount.is_finite() or not approval_threshold.is_finite():
++        raise ValueError("Refund and threshold must be finite.")
+     if refund_amount < Decimal("0"):
+         raise ValueError("Refund amount cannot be negative.")
+ 
+@@ -61,4 +66,14 @@ def check_refund_authorization(
+             ),
+         )
+ 
+-    return AuthorizationResult(approval_required=False)
+\ No newline at end of file
++    return AuthorizationResult(approval_required=False)
++
++
++def customer_tier(customer) -> str:
++    """Read the explicit legacy tier marker, never infer a tier with an LLM."""
++    notes = getattr(customer, "notes", None) or ""
++    return "preferred" if re.match(r"^\s*Preferred customer tier\b", notes, re.I) else "regular"
++
++
++def discount_limit(customer) -> Decimal:
++    return Decimal("15") if customer_tier(customer) == "preferred" else Decimal("10")
+diff --git a/backend/app/services/communication_service.py b/backend/app/services/communication_service.py
+index 9354637..a21c943 100644
+--- a/backend/app/services/communication_service.py
++++ b/backend/app/services/communication_service.py
+@@ -113,6 +113,7 @@ class CommunicationService:
+         communication_type: str | None = None,
+         direction: str | None = None,
+         status: str | None = None,
++        limit: int | None = None,
+     ) -> list[Communication]:
+         self._require_customer(customer_id)
+ 
+@@ -125,6 +126,12 @@ class CommunicationService:
+         if status is not None and status not in STATUSES:
+             raise ValidationError("Invalid communication status.")
+ 
++        if limit is not None:
++            if not 1 <= limit <= 100:
++                raise ValidationError("History limit must be between 1 and 100.")
++            return self.communication_repository.list_by_customer(
++                customer_id=customer_id, communication_type=communication_type,
++                direction=direction, status=status, limit=limit)
+         return self.communication_repository.list_by_customer(
+             customer_id=customer_id,
+             communication_type=communication_type,
+@@ -152,4 +159,3 @@ class CommunicationService:
+ 
+         if direction not in DIRECTIONS:
+             raise ValidationError("Invalid communication direction.")
+-
+diff --git a/backend/app/services/exceptions.py b/backend/app/services/exceptions.py
+index 46ce656..4a66292 100644
+--- a/backend/app/services/exceptions.py
++++ b/backend/app/services/exceptions.py
+@@ -25,3 +25,13 @@ class InsufficientStockError(ServiceError):
+ 
+ class InvalidStatusTransitionError(ServiceError):
+     """Raised when an entity cannot move to the requested status."""
++
++
++class ApprovalRequired(ServiceError):
++    """A validated proposed action that must be reviewed before execution."""
++
++    def __init__(self, action_type: str, payload: dict, reason: str):
++        super().__init__(reason)
++        self.action_type = action_type
++        self.payload = payload
++        self.reason = reason
+diff --git a/backend/app/services/invoice_service.py b/backend/app/services/invoice_service.py
+index 93ea95c..e374cc2 100644
+--- a/backend/app/services/invoice_service.py
++++ b/backend/app/services/invoice_service.py
+@@ -41,6 +41,8 @@ class InvoiceService:
+         as_of: date,
+     ) -> int:
+         invoice = self.get_invoice(invoice_id)
++        if invoice.status in {"paid", "cancelled", "draft"} or outstanding_balance(invoice) == 0:
++            return 0
+         return calculate_days_overdue(invoice.due_date, as_of)
+ 
+     def refresh_status(
+@@ -75,10 +77,14 @@ class InvoiceService:
+         paid_at: datetime | None = None,
+         as_of: date | None = None,
+     ):
+-        if amount <= Decimal("0"):
++        if not amount.is_finite() or amount <= Decimal("0"):
+             raise ValidationError("Payment amount must be greater than zero.")
++        if amount != amount.quantize(Decimal("0.01")):
++            raise ValidationError("Payment must have at most two decimal places.")
+ 
+         invoice = self.get_invoice(invoice_id)
++        if invoice.status == "cancelled":
++            raise ValidationError("Cannot record payment on a cancelled invoice.")
+         total_paid = calculate_total_paid(invoice.payments)
+ 
+         if total_paid + amount > invoice.amount:
+@@ -109,6 +115,12 @@ def calculate_total_paid(
+     )
+ 
+ 
++def outstanding_balance(invoice) -> Decimal:
++    if invoice.status in {"paid", "cancelled"}:
++        return Decimal("0.00")
++    return max(invoice.amount - calculate_total_paid(invoice.payments), Decimal("0.00"))
++
++
+ def calculate_days_overdue(
+     due_date: date,
+     as_of: date,
+@@ -149,4 +161,3 @@ def calculate_invoice_status(
+         return "partially_paid"
+ 
+     return "sent"
+-
+diff --git a/backend/app/services/order_service.py b/backend/app/services/order_service.py
+index 8fafa24..463abb9 100644
+--- a/backend/app/services/order_service.py
++++ b/backend/app/services/order_service.py
+@@ -71,6 +71,9 @@ class OrderService:
+                 f"Cannot move order from {order.status} to {new_status}."
+             )
+ 
++        if new_status == "processing":
++            return self.fulfill_order(order_id)
++
+         order.status = new_status
+         now = datetime.now(timezone.utc)
+ 
+@@ -125,5 +128,3 @@ class OrderService:
+             (item.line_total for item in items),
+             Decimal("0.00"),
+         )
+-
+-
+diff --git a/backend/app/services/quote_service.py b/backend/app/services/quote_service.py
+index 4f1bbea..9a46f96 100644
+--- a/backend/app/services/quote_service.py
++++ b/backend/app/services/quote_service.py
+@@ -16,7 +16,8 @@ Methods:
+ '''
+ 
+ from dataclasses import dataclass
+-from decimal import Decimal
++from decimal import Decimal, ROUND_HALF_UP
++from datetime import datetime, timezone
+ from uuid import UUID
+ 
+ from backend.app.db.models.order import Order
+@@ -34,11 +35,13 @@ class QuoteLineItem:
+     unit_price: Decimal
+ 
+     def __post_init__(self) -> None:
+-        if self.quantity <= 0:
++        if isinstance(self.quantity, bool) or not isinstance(self.quantity, int) or self.quantity <= 0:
+             raise ValueError("Quantity must be greater than zero.")
+ 
+-        if self.unit_price < Decimal("0"):
++        if not self.unit_price.is_finite() or self.unit_price < Decimal("0"):
+             raise ValueError("Unit price cannot be negative.")
++        if self.unit_price != self.unit_price.quantize(Decimal("0.01")):
++            raise ValueError("Unit price must have at most two decimal places.")
+ 
+     @property
+     def line_total(self) -> Decimal:
+@@ -58,15 +61,15 @@ def calculate_discount_amount(
+     subtotal: Decimal,
+     discount_percent: Decimal,
+ ) -> Decimal:
+-    if subtotal < Decimal("0"):
++    if not subtotal.is_finite() or subtotal < Decimal("0"):
+         raise ValueError("Subtotal cannot be negative.")
+ 
+-    if not Decimal("0") <= discount_percent <= Decimal("100"):
++    if not discount_percent.is_finite() or not Decimal("0") <= discount_percent <= Decimal("100"):
+         raise ValueError(
+             "Discount percentage must be between 0 and 100."
+         )
+ 
+-    return subtotal * discount_percent / Decimal("100")
++    return (subtotal * discount_percent / Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+ 
+ 
+ def calculate_quote_total(
+@@ -90,6 +93,14 @@ class QuoteService:
+         self.quote_repository = quote_repository
+         self.order_repository = order_repository
+ 
++    @staticmethod
++    def require_editable(quote):
++        if quote.status in {"converted", "expired", "rejected", "pending_approval"}:
++            raise ValidationError(f"Cannot edit a {quote.status} quote.")
++        expires = getattr(quote, "expires_at", None)
++        if expires and expires.replace(tzinfo=expires.tzinfo or timezone.utc) <= datetime.now(timezone.utc):
++            raise ValidationError("Quote has expired.")
++
+     def add_line_item(
+         self,
+         quote_id: UUID,
+@@ -103,6 +114,8 @@ class QuoteService:
+             raise NotFoundError(f"Quote {quote_id} was not found.")
+ 
+         line_item = QuoteLineItem(quantity, unit_price)
++        self.require_editable(quote)
++        quote.status = "draft"
+         quote_item = QuoteItem(
+             quote_id=quote.id,
+             product_id=product_id,
+@@ -138,6 +151,8 @@ class QuoteService:
+             raise NotFoundError(f"Quote item {item_id} was not found.")
+ 
+         line_item = QuoteLineItem(quantity, unit_price)
++        self.require_editable(quote)
++        quote.status = "draft"
+         quote_item.quantity = line_item.quantity
+         quote_item.unit_price = line_item.unit_price
+         quote_item.line_total = line_item.line_total
+@@ -165,6 +180,8 @@ class QuoteService:
+         if quote_item is None:
+             raise NotFoundError(f"Quote item {item_id} was not found.")
+ 
++        self.require_editable(quote)
++        quote.status = "draft"
+         self.quote_repository.delete_item(quote_item)
+         quote.items.remove(quote_item)
+         self.recalculate_quote(quote)
+@@ -206,10 +223,13 @@ class QuoteService:
+         if quote is None:
+             raise NotFoundError(f"Quote {quote_id} was not found.")
+ 
+-        if not Decimal("0") <= discount_percent <= Decimal("100"):
++        self.require_editable(quote)
++        if not discount_percent.is_finite() or not Decimal("0") <= discount_percent <= Decimal("25"):
+             raise ValidationError(
+-                "Discount percentage must be between 0 and 100."
++                "Discount percentage must be between 0 and 25 under OfficeHub policy."
+             )
++        if discount_percent != discount_percent.quantize(Decimal("0.01")):
++            raise ValidationError("Discount must have at most two decimal places.")
+ 
+         authorization = check_discount_authorization(
+             discount_percent=discount_percent,
+@@ -222,6 +242,10 @@ class QuoteService:
+         if authorization.approval_required:
+             quote.status = "pending_approval"
+             quote = self.quote_repository.save(quote)
++        else:
++            quote.status = "approved"
++            quote.approval_id = None
++            quote = self.quote_repository.save(quote)
+ 
+         return quote
+ 
+@@ -238,9 +262,13 @@ class QuoteService:
+             raise ValidationError(
+                 "Only approved quotes can be converted to orders."
+             )
++        self.require_editable(quote)
++
++        if not quote.items:
++            raise ValidationError("Cannot convert an empty quote.")
+ 
+         order = self.order_repository.create_from_quote(quote)
+         quote.status = "converted"
+         self.quote_repository.save(quote)
+ 
+-        return order
+\ No newline at end of file
++        return order
+diff --git a/backend/tests/unit/test_quote_service.py b/backend/tests/unit/test_quote_service.py
+index 6f9aa9f..f5b6212 100644
+--- a/backend/tests/unit/test_quote_service.py
++++ b/backend/tests/unit/test_quote_service.py
+@@ -115,7 +115,7 @@ def test_approved_quote_converts_to_order():
+         discount_percent=Decimal("0"),
+         discount_amount=Decimal("0.00"),
+         total=Decimal("200.00"),
+-        items=[],
++        items=[SimpleNamespace(quantity=1, unit_price=Decimal("200.00"), line_total=Decimal("200.00"))],
+     )
+ 
+     expected_order = object()
+@@ -158,4 +158,4 @@ def test_discount_above_threshold_requires_quote_approval():
+     )
+ 
+     assert result.status == "pending_approval"
+-    assert quote_repository.saved_quote is quote
+\ No newline at end of file
++    assert quote_repository.saved_quote is quote
+diff --git a/agents/graph/nodes/approval_helpers.py b/agents/graph/nodes/approval_helpers.py
+new file mode 100644
+--- /dev/null
++++ b/agents/graph/nodes/approval_helpers.py
+@@ -0,0 +1,80 @@
++"""Persist one exact approval proposal per request and resume it without replay."""
++from datetime import datetime, timezone
++from decimal import Decimal
++from uuid import NAMESPACE_URL, uuid5
++from langgraph.types import interrupt
++from sqlalchemy import select
++from backend.app.db.database import SessionLocal
++from backend.app.db.models.approval_request import ApprovalRequest
++from backend.app.db.repositories.quote_repository import QuoteRepository
++from backend.app.db.repositories.order_repository import OrderRepository
++from backend.app.services.quote_service import QuoteService
++from backend.app.services.exceptions import ValidationError
++
++
++def approval_key(state, action_type):
++    return uuid5(NAMESPACE_URL, f"officehub:{state['request_id']}:{action_type}")
++
++
++def saved_approval(state, action_type):
++    with SessionLocal() as db:
++        return db.get(ApprovalRequest, approval_key(state, action_type)) is not None
++
++
++def review_action(state, config, action_type, proposal=None, reason="", results=None):
++    approval_id = approval_key(state, action_type)
++    with SessionLocal() as db:
++        row = db.get(ApprovalRequest, approval_id)
++        if row is None:
++            if proposal is None:
++                raise ValidationError("Missing approval proposal.")
++            payload = {"proposal": proposal, "thread_id": config["configurable"]["thread_id"],
++                       "request_id": state["request_id"], "results": results or []}
++            row = ApprovalRequest(id=approval_id, action_type=action_type,
++                                  action_payload=payload, reason=reason, status="pending",
++                                  requested_by="agent", created_at=datetime.now(timezone.utc))
++            db.add(row)
++            db.flush()
++            if action_type == "quote_discount_approval":
++                quote = QuoteRepository(db).get_with_items(proposal["quote_id"])
++                if quote is None:
++                    raise ValidationError("Quote no longer exists.")
++                QuoteService.require_editable(quote)
++                if quote.status != proposal["previous_status"] or str(quote.subtotal) != proposal["subtotal"] or str(quote.total) != proposal["total"]:
++                    raise ValidationError("Quote changed while approval was being prepared; retry.")
++                quote.status = "pending_approval"
++                quote.approval_id = approval_id
++            db.commit()
++        reason = row.reason
++    # GraphInterrupt must propagate; no DB transaction stays open during the wait.
++    decision = interrupt({"approval_id": str(approval_id), "action_type": action_type, "reason": reason})
++    if not isinstance(decision, dict) or decision.get("approval_id") != str(approval_id):
++        raise ValidationError("Approval decision does not match the pending action.")
++    status = "approved" if decision.get("approved") is True else "rejected"
++    with SessionLocal() as db:
++        row = db.scalars(select(ApprovalRequest).where(ApprovalRequest.id == approval_id).with_for_update()).one()
++        if row.status != status:
++            raise ValidationError("The manager decision has not been persisted.")
++        payload = dict(row.action_payload)
++        if "execution_result" not in payload:
++            proposal = payload["proposal"]
++            result = "Refund review recorded; no refund was issued by this system."
++            if action_type == "quote_discount_approval":
++                quote = QuoteRepository(db).get_with_items(proposal["quote_id"])
++                if quote is None or quote.approval_id != approval_id or quote.status != "pending_approval":
++                    raise ValidationError("Quote no longer matches this pending approval.")
++                quote.status = proposal["previous_status"]
++                if status == "approved":
++                    service = QuoteService(QuoteRepository(db), OrderRepository(db))
++                    quote = service.apply_discount(quote.id, Decimal(proposal["discount_percent"]), Decimal("25"))
++                    quote.approval_id = approval_id
++                    result = f"Discount applied to {quote.quote_number}. Total: ${quote.total}. No order was created."
++                else:
++                    quote.approval_id = None
++                    result = "Discount rejected; the previous quote price and status were preserved."
++            payload["execution_result"] = result
++            row.action_payload = payload
++            db.commit()
++        return {"approval_required": True, "approval_id": str(approval_id), "approval_decision": status,
++                "action_results": payload.get("results", []) + [
++                    {"tool": "manager_approval", "result": payload["execution_result"]}]}
+diff --git a/agents/tools/followup_tools.py b/agents/tools/followup_tools.py
+new file mode 100644
+--- /dev/null
++++ b/agents/tools/followup_tools.py
+@@ -0,0 +1,26 @@
++"""Individual conversational follow-up creation."""
++import logging
++from langchain_core.tools import tool
++from backend.app.db.database import SessionLocal
++from backend.app.services.followup_service import create_followup
++
++logger = logging.getLogger(__name__)
++
++
++@tool
++def create_followup_task(customer_id: str, scheduled_at: str, task_type: str = "manual_reminder", quote_id: str = "") -> str:
++    """Schedule one future follow-up for a verified customer UUID.
++
++    scheduled_at must be ISO 8601 including time and timezone offset. If the
++    user's time or timezone is unknown, ask for it rather than assuming now.
++    Resolve a customer name with search_customer before calling this tool.
++    This schedules a reminder; it does not send an email.
++    """
++    with SessionLocal() as db:
++        try:
++            task = create_followup(db, task_type, scheduled_at, customer_id, quote_id or None)
++            return f"Follow-up task created: {task.id}; customer: {task.customer_id}; scheduled_at: {task.scheduled_at.isoformat()}"
++        except Exception as exc:
++            db.rollback()
++            logger.exception("Follow-up creation failed")
++            return f"Error creating follow-up task: {exc}"
+diff --git a/alembic/versions/004_followup_claims_and_query_indexes.py b/alembic/versions/004_followup_claims_and_query_indexes.py
+new file mode 100644
+--- /dev/null
++++ b/alembic/versions/004_followup_claims_and_query_indexes.py
+@@ -0,0 +1,38 @@
++"""Track follow-up claims and index existing operational query paths.
++
++Revision ID: 004
++Revises: 003
++"""
++from alembic import op
++import sqlalchemy as sa
++
++revision = "004"
++down_revision = "003"
++branch_labels = None
++depends_on = None
++
++INDEXES = [
++    ("ix_followup_due", "followup_tasks", ["status", "scheduled_at"]),
++    ("ix_approval_pending", "approval_requests", ["status", "created_at"]),
++    ("ix_quote_approval", "quotes", ["approval_id"]),
++    ("ix_audit_run_time", "audit_logs", ["run_id", "timestamp"]),
++    ("ix_quote_items_quote", "quote_items", ["quote_id"]),
++    ("ix_order_items_order", "order_items", ["order_id"]),
++    ("ix_payments_invoice", "payments", ["invoice_id"]),
++]
++
++
++def upgrade():
++    inspector = sa.inspect(op.get_bind())
++    # 003 imports current metadata, so a fresh installation already has this column.
++    if "started_at" not in {c["name"] for c in inspector.get_columns("followup_tasks")}:
++        op.add_column("followup_tasks", sa.Column("started_at", sa.DateTime(timezone=True), nullable=True))
++    for name, table, columns in INDEXES:
++        if name not in {i["name"] for i in inspector.get_indexes(table)}:
++            op.create_index(name, table, columns)
++
++
++def downgrade():
++    for name, table, _ in reversed(INDEXES):
++        op.drop_index(name, table_name=table)
++    op.drop_column("followup_tasks", "started_at")
+diff --git a/backend/app/services/execution_service.py b/backend/app/services/execution_service.py
+new file mode 100644
+--- /dev/null
++++ b/backend/app/services/execution_service.py
+@@ -0,0 +1,21 @@
++"""Verify a follow-up produced a persisted communication, not just prose."""
++import re
++from uuid import UUID
++from backend.app.db.models.communication import Communication
++
++
++def require_logged_communication(result, session, customer_id, entity_type=None, entity_id=None):
++    if result.get("error") or (result.get("approval_required") and not result.get("approval_decision")):
++        raise ValueError(result.get("error") or "The operation is awaiting approval.")
++    for action in result.get("action_results", []):
++        if action.get("tool") != "log_communication":
++            continue
++        match = re.search(r"\bID: ([0-9a-fA-F-]{36})", str(action.get("result", "")))
++        if not match:
++            continue
++        comm = session.get(Communication, UUID(match.group(1)))
++        if comm and comm.customer_id == customer_id and comm.direction == "outbound" and comm.status != "failed":
++            if entity_id and (comm.related_entity_id != entity_id or comm.related_entity_type != entity_type):
++                continue
++            return comm
++    raise ValueError("No matching follow-up communication was recorded; nothing was sent.")
+diff --git a/backend/app/services/followup_service.py b/backend/app/services/followup_service.py
+new file mode 100644
+--- /dev/null
++++ b/backend/app/services/followup_service.py
+@@ -0,0 +1,35 @@
++"""Validation shared by the task API and conversational scheduling tool."""
++from datetime import datetime, timezone
++from uuid import UUID
++from backend.app.db.models.customer import Customer
++from backend.app.db.models.quote import Quote
++from backend.app.db.repositories.followup_repository import FollowupRepository
++from backend.app.services.exceptions import ValidationError, NotFoundError
++
++
++def create_followup(session, task_type, scheduled_at, customer_id=None, quote_id=None):
++    try:
++        customer_id = UUID(str(customer_id)) if customer_id else None
++        quote_id = UUID(str(quote_id)) if quote_id else None
++        if isinstance(scheduled_at, str):
++            scheduled_at = datetime.fromisoformat(scheduled_at)
++    except (ValueError, TypeError) as exc:
++        raise ValidationError("Use valid UUIDs and an ISO 8601 timestamp with a timezone offset.") from exc
++    if scheduled_at.tzinfo is None or scheduled_at.utcoffset() is None:
++        raise ValidationError("Scheduled time must include a timezone offset.")
++    if scheduled_at <= datetime.now(timezone.utc):
++        raise ValidationError("Scheduled time must be in the future.")
++    if not task_type.strip():
++        raise ValidationError("Task type cannot be empty.")
++    if customer_id and session.get(Customer, customer_id) is None:
++        raise NotFoundError("Customer not found.")
++    if quote_id:
++        quote = session.get(Quote, quote_id)
++        if quote is None:
++            raise NotFoundError("Quote not found.")
++        if customer_id and quote.customer_id != customer_id:
++            raise ValidationError("Quote does not belong to this customer.")
++        customer_id = customer_id or quote.customer_id
++    if customer_id is None:
++        raise ValidationError("A customer or quote is required.")
++    return FollowupRepository(session).create(task_type.strip(), scheduled_at.astimezone(timezone.utc), customer_id, quote_id)
+diff --git a/backend/tests/audit/conftest.py b/backend/tests/audit/conftest.py
+new file mode 100644
+--- /dev/null
++++ b/backend/tests/audit/conftest.py
+@@ -0,0 +1,40 @@
++"""Offline regressions: never use the configured deployment database or LLM."""
++import os
++os.environ["DATABASE_URL"] = "sqlite+pysqlite:///:memory:"
++os.environ["SCHEDULER_ENABLED"] = "false"
++
++from datetime import datetime, timezone
++from uuid import uuid4
++import pytest
++from sqlalchemy import create_engine, event
++from sqlalchemy.orm import sessionmaker
++from sqlalchemy.pool import StaticPool
++from sqlalchemy.ext.compiler import compiles
++from sqlalchemy.dialects.postgresql import JSONB
++from agents.memory.checkpointer import get_checkpointer
++
++get_checkpointer(force_memory=True)
++
++
++@compiles(JSONB, "sqlite")
++def jsonb_sqlite(type_, compiler, **kw):
++    return "JSON"
++
++
++@pytest.fixture
++def database(monkeypatch):
++    from backend.app.db.models import Base
++    engine = create_engine("sqlite+pysqlite:///:memory:", poolclass=StaticPool,
++                           connect_args={"check_same_thread": False})
++    @event.listens_for(engine, "connect")
++    def functions(conn, record):
++        conn.create_function("gen_random_uuid", 0, lambda: uuid4().hex)
++        conn.create_function("now", 0, lambda: datetime.now(timezone.utc).replace(tzinfo=None).isoformat(' '))
++    Base.metadata.create_all(engine)
++    sessions = sessionmaker(engine, autoflush=False)
++    import backend.app.db.database as db_module
++    monkeypatch.setattr(db_module, "SessionLocal", sessions)
++    from agents.graph.nodes import approval_helpers
++    monkeypatch.setattr(approval_helpers, "SessionLocal", sessions)
++    yield sessions
++    engine.dispose()
+diff --git a/backend/tests/audit/test_api_and_recovery.py b/backend/tests/audit/test_api_and_recovery.py
+new file mode 100644
+--- /dev/null
++++ b/backend/tests/audit/test_api_and_recovery.py
+@@ -0,0 +1,177 @@
++from contextlib import nullcontext
++from datetime import datetime, timezone
++from decimal import Decimal
++from uuid import uuid4
++from unittest.mock import Mock
++import importlib
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++from langchain_core.messages import AIMessage
++from langgraph.graph import StateGraph, END
++from langgraph.checkpoint.memory import MemorySaver
++from backend.app.db.models import User, Customer, ApprovalRequest, Quote
++from backend.app.api.dependencies import get_db
++from backend.app.api.router import api_router
++from agents.graph.state import AgentState
++from test_regressions import seed_quote
++
++
++@pytest.fixture
++def client(database):
++    app = FastAPI()
++    app.include_router(api_router)
++    def sessions():
++        with database() as db:
++            yield db
++    app.dependency_overrides[get_db] = sessions
++    with TestClient(app) as client:
++        yield client
++
++
++def test_demo_identity_uses_database_role_and_ignores_reviewer_body(database, client, monkeypatch):
++    _, _, manager_id = seed_quote(database)
++    staff_id, approval_id = uuid4(), uuid4()
++    with database() as db:
++        db.add(User(id=staff_id, email='staff@test.local', hashed_password='unused', full_name='Staff', role='staff', is_active=True))
++        db.add(ApprovalRequest(id=approval_id, action_type='refund_approval', action_payload={}, reason='test', status='pending'))
++        db.commit()
++    assert client.get('/api/v1/customers').status_code == 401
++    assert client.get('/api/v1/customers', headers={'X-User-Id': 'not-a-uuid'}).status_code == 401
++    assert client.post(f'/api/v1/approvals/{approval_id}/approve', headers={'X-User-Id': str(staff_id), 'X-User-Role': 'admin'}).status_code == 403
++    routes = importlib.import_module('backend.app.api.routes.approvals')
++    resume = Mock(return_value={'response': 'Decision recorded', 'approval_decision': 'approved'})
++    monkeypatch.setattr(routes, 'resume_agent', resume)
++    response = client.post(f'/api/v1/approvals/{approval_id}/approve', headers={'X-User-Id': str(manager_id), 'X-User-Role': 'staff'}, json={'approved_by': str(staff_id)})
++    assert response.status_code == 200
++    assert resume.call_args.kwargs['reviewer_id'] == str(manager_id)
++
++
++def test_customer_limit_tier_quote_shapes_and_status_filters(database, client):
++    _, quote_id, manager_id = seed_quote(database, 'Preferred customer tier - approved for up to 15% discount.')
++    with database() as db:
++        db.add(Customer(id=uuid4(), name='Ahmed Second')); db.commit()
++    headers = {'X-User-Id': str(manager_id)}
++    response = client.get('/api/v1/customers?query=Ahmed&limit=1', headers=headers)
++    assert len(response.json()) == 1
++    assert response.json()[0]['tier'] == 'preferred'
++    assert client.get('/api/v1/customers?limit=-1', headers=headers).status_code == 422
++    quote = client.get(f'/api/v1/quotes/{quote_id}', headers=headers).json()
++    listed = client.get('/api/v1/quotes?status=approved', headers=headers).json()[0]
++    assert quote == listed
++    for path in ['quotes', 'orders', 'invoices']:
++        assert client.get(f'/api/v1/{path}?status=invalid', headers=headers).status_code == 422
++
++
++def test_task_api_rejects_invalid_identity_and_timezone(database, client):
++    customer_id, _, manager_id = seed_quote(database)
++    headers = {'X-User-Id': str(manager_id)}
++    body = {'task_type': 'manual_reminder', 'scheduled_at': '2099-01-01T09:00:00+05:00', 'customer_id': 'Ahmed'}
++    assert client.post('/api/v1/tasks', json=body, headers=headers).status_code == 422
++    body['customer_id'] = str(customer_id)
++    body['scheduled_at'] = '2099-01-01T09:00:00'
++    assert client.post('/api/v1/tasks', json=body, headers=headers).status_code == 422
++    body['scheduled_at'] += '+05:00'
++    response = client.post('/api/v1/tasks', json=body, headers=headers)
++    assert response.status_code == 200
++    assert response.json()['customer_id'] == str(customer_id)
++
++
++def test_facade_resume_can_retry_execution_failure_without_replaying_llm(database, monkeypatch):
++    from agents import agent_service
++    from agents.tools import quote_tools
++    from backend.app.services.quote_service import QuoteService
++    module = importlib.import_module('agents.graph.nodes.create_quote_node')
++    _, quote_id, manager_id = seed_quote(database)
++    monkeypatch.setattr(quote_tools, 'SessionLocal', database)
++    monkeypatch.setattr(agent_service, 'SessionLocal', database)
++    monkeypatch.setattr(agent_service, '_thread_lock', lambda key: nullcontext())
++    llm = Mock()
++    llm.bind_tools.return_value = llm
++    llm.invoke.return_value = AIMessage(content='', tool_calls=[{'name': 'apply_discount_to_quote', 'args': {'quote_id': str(quote_id), 'discount_percent': 20}, 'id': 'd'}])
++    monkeypatch.setattr(module, 'get_llm', lambda: llm)
++    builder = StateGraph(AgentState)
++    builder.add_node('quote', module.create_quote_node)
++    builder.set_entry_point('quote'); builder.add_edge('quote', END)
++    graph = builder.compile(checkpointer=MemorySaver())
++    monkeypatch.setattr(agent_service, 'agent_graph', graph)
++    config = {'configurable': {'thread_id': 'retry-test'}}
++    result = graph.invoke({'request_id': str(uuid4()), 'user_input': 'apply 20% discount', 'entities': {}, 'messages': []}, config)
++    approval_id = result['__interrupt__'][0].value['approval_id']
++    apply = QuoteService.apply_discount
++    monkeypatch.setattr(QuoteService, 'apply_discount', Mock(side_effect=RuntimeError('temporary failure')))
++    with pytest.raises(RuntimeError, match='temporary'):
++        agent_service.resume_agent(approval_id, True, reviewer_id=str(manager_id))
++    monkeypatch.setattr(QuoteService, 'apply_discount', apply)
++    resumed = agent_service.resume_agent(approval_id, True, reviewer_id=str(manager_id))
++    assert resumed['approval_decision'] == 'approved'
++    assert agent_service.resume_agent(approval_id, True, reviewer_id=str(manager_id)) == resumed
++    assert llm.invoke.call_count == 1
++    with database() as db:
++        assert db.get(Quote, quote_id).total == Decimal('80')
++
++
++def test_workflow_rejects_unbound_tool_and_preserves_clarification(monkeypatch):
++    module = importlib.import_module('agents.graph.nodes.customer_mgmt_node')
++    llm = Mock()
++    llm.bind_tools.return_value = llm
++    llm.invoke.side_effect = [AIMessage(content='', tool_calls=[{'name': 'update_inventory', 'args': {}, 'id': 'x'}]), AIMessage(content='Which customer?')]
++    monkeypatch.setattr(module, 'get_llm', lambda: llm)
++    result = module.customer_mgmt_node({'user_input': 'update customer', 'messages': []})
++    assert 'unavailable' in result['action_results'][0]['result']
++    assert result['action_results'][-1]['result'] == 'Which customer?'
++
++
++def test_inventory_runs_dependent_tool_rounds(monkeypatch):
++    module = importlib.import_module('agents.graph.nodes.check_inventory_node')
++    first, second = Mock(), Mock()
++    first.name = 'get_low_stock_products'; first.invoke.return_value = 'P-1 has low stock'
++    second.name = 'update_inventory'; second.invoke.return_value = 'Adjusted P-1'
++    monkeypatch.setattr(module, '_get_tools_for_inventory', lambda: [first, second])
++    llm = Mock(); llm.bind_tools.return_value = llm
++    llm.invoke.side_effect = [AIMessage(content='', tool_calls=[{'name': first.name, 'args': {}, 'id': '1'}]),
++                              AIMessage(content='', tool_calls=[{'name': second.name, 'args': {'product_id': 'P-1', 'change_quantity': 10}, 'id': '2'}]), AIMessage(content='Done')]
++    monkeypatch.setattr(module, 'get_llm', lambda: llm)
++    result = module.check_inventory_node({'user_input': 'restock low items', 'messages': []})
++    second.invoke.assert_called_once()
++    assert len(result['action_results']) == 3
++
++
++def test_llm_constructor_failure_uses_fallback(monkeypatch):
++    module = importlib.import_module('agents.graph.nodes.classify_intent')
++    monkeypatch.setattr(module, '_get_llm', Mock(side_effect=RuntimeError('missing key')))
++    assert module.classify_intent({'user_input': 'Remind Ahmed about his overdue invoice'})['intent'] == 'follow_up'
++
++
++def test_full_graph_records_runs_nodes_tools_and_conversation(database, monkeypatch):
++    from agents import agent_service
++    from agents.graph.graph import build_graph
++    from agents.tools import inventory_tools
++    from backend.app.core import audit
++    from backend.app.db.models import AgentRun, AuditLog
++    seed_quote(database)
++    monkeypatch.setattr(agent_service, 'SessionLocal', database)
++    monkeypatch.setattr(audit, 'SessionLocal', database)
++    monkeypatch.setattr(inventory_tools, 'SessionLocal', database)
++    monkeypatch.setattr(agent_service, '_thread_lock', lambda key: nullcontext())
++    monkeypatch.setattr(agent_service, 'agent_graph', build_graph(MemorySaver()))
++    for module_name, content in [('classify_intent', 'inventory_check'), ('identify_entities', '{}')]:
++        module = importlib.import_module('agents.graph.nodes.' + module_name)
++        llm = Mock(); llm.invoke.return_value = AIMessage(content=content)
++        monkeypatch.setattr(module, '_get_llm', lambda llm=llm: llm)
++    inventory = importlib.import_module('agents.graph.nodes.check_inventory_node')
++    llm = Mock(); llm.bind_tools.return_value = llm
++    llm.invoke.side_effect = [AIMessage(content='', tool_calls=[{'name': 'get_all_products', 'args': {}, 'id': 'catalog'}]), AIMessage(content='Paper is available.')]
++    monkeypatch.setattr(inventory, 'get_llm', lambda: llm)
++    response_node = importlib.import_module('agents.graph.nodes.formulate_response')
++    final_llm = Mock(); final_llm.invoke.return_value = AIMessage(content='Paper is available.')
++    monkeypatch.setattr(response_node, 'get_llm', lambda **kwargs: final_llm)
++    result = agent_service.run_agent('List products', thread_id='history-test')
++    assert not result['error']
++    with database() as db:
++        run = db.query(AgentRun).one()
++        assert run.status == 'completed'
++        assert db.query(AuditLog).filter(AuditLog.run_id == run.id).count() >= 7
++    state = agent_service.agent_graph.get_state({'configurable': {'thread_id': 'history-test'}})
++    assert state.values['messages'][-2].content == 'List products'
++    assert state.values['messages'][-1].content == 'Paper is available.'
+diff --git a/backend/tests/audit/test_migration.py b/backend/tests/audit/test_migration.py
+new file mode 100644
+--- /dev/null
++++ b/backend/tests/audit/test_migration.py
+@@ -0,0 +1,20 @@
++from alembic.migration import MigrationContext
++from alembic.operations import Operations
++from sqlalchemy import inspect
++
++
++def test_migration_handles_fresh_metadata_and_existing_schema(database):
++    # Local alembic directory intentionally has no __init__; load the revision by path.
++    import importlib.util
++    spec = importlib.util.spec_from_file_location('audit_revision', 'alembic/versions/004_followup_claims_and_query_indexes.py')
++    migration = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(migration)
++    with database.kw['bind'].begin() as conn:
++        migration.op = Operations(MigrationContext.configure(conn))
++        migration.upgrade()
++        migration.upgrade()
++        assert 'ix_followup_due' in {index['name'] for index in inspect(conn).get_indexes('followup_tasks')}
++        migration.downgrade()
++        assert 'started_at' not in {column['name'] for column in inspect(conn).get_columns('followup_tasks')}
++        migration.upgrade()
++        assert 'started_at' in {column['name'] for column in inspect(conn).get_columns('followup_tasks')}
+diff --git a/backend/tests/audit/test_regressions.py b/backend/tests/audit/test_regressions.py
+new file mode 100644
+--- /dev/null
++++ b/backend/tests/audit/test_regressions.py
+@@ -0,0 +1,181 @@
++from datetime import date, datetime, timedelta, timezone
++from decimal import Decimal
++from types import SimpleNamespace
++from uuid import uuid4
++from unittest.mock import Mock
++import importlib
++import pytest
++from langchain_core.messages import AIMessage
++from langgraph.graph import StateGraph, END
++from langgraph.checkpoint.memory import MemorySaver
++from langgraph.types import Command
++
++from backend.app.db.models import Customer, Quote, QuoteItem, Product, User, ApprovalRequest, Invoice, Payment, FollowupTask, Communication
++from backend.app.services.exceptions import ValidationError, NotFoundError
++from backend.app.services.followup_service import create_followup
++from backend.app.services.quote_service import calculate_discount_amount, calculate_quote_total
++from backend.app.services.invoice_service import outstanding_balance, InvoiceService
++from backend.app.db.repositories.approval_repository import ApprovalRepository
++from backend.app.db.repositories.invoice_repository import InvoiceRepository
++from backend.app.db.repositories.payment_repository import PaymentRepository
++from backend.app.db.repositories.followup_repository import FollowupRepository
++from backend.app.services.execution_service import require_logged_communication
++
++
++def seed_quote(sessions, notes='Regular customer tier.'):
++    with sessions() as db:
++        customer = Customer(id=uuid4(), name='Ahmed', notes=notes)
++        product = Product(id=uuid4(), name='Paper', sku='P-1', category='Office', unit_price=Decimal('100'), stock_quantity=10, reorder_threshold=2)
++        quote = Quote(id=uuid4(), quote_number='Q-1', customer_id=customer.id, status='approved', subtotal=Decimal('100'), total=Decimal('100'), discount_percent=0, discount_amount=0)
++        db.add_all([customer, product, quote]); db.flush()
++        db.add(QuoteItem(quote_id=quote.id, product_id=product.id, quantity=1, unit_price=100, line_total=100))
++        manager = User(id=uuid4(), email='manager@test.local', hashed_password='unused', full_name='Manager', role='manager', is_active=True)
++        db.add(manager); db.commit()
++        return customer.id, quote.id, manager.id
++
++
++def test_currency_rounding_is_consistent():
++    assert calculate_discount_amount(Decimal('.05'), Decimal('10')) == Decimal('.01')
++    assert calculate_quote_total(Decimal('.05'), Decimal('10')) == Decimal('.04')
++
++
++def test_discount_tool_commits_and_preferred_policy_is_server_owned(database, monkeypatch):
++    from agents.tools import quote_tools
++    _, quote_id, _ = seed_quote(database, 'Preferred customer tier - approved for up to 15% discount.')
++    monkeypatch.setattr(quote_tools, 'SessionLocal', database)
++    assert 'Error' not in quote_tools.apply_discount_to_quote.invoke({'quote_id': str(quote_id), 'discount_percent': 15})
++    with database() as db:
++        quote = db.get(Quote, quote_id)
++        assert quote.total == Decimal('85')
++        assert quote.status == 'approved'
++    assert 'approval_threshold' not in quote_tools.apply_discount_to_quote.args
++    assert 'Error' in quote_tools.apply_discount_to_quote.invoke({'quote_id': str(quote_id), 'discount_percent': 26})
++
++
++@pytest.mark.parametrize('approved', [True, False])
++def test_real_interrupt_resume_preserves_identity_and_does_not_replay(database, monkeypatch, approved):
++    from agents.tools import quote_tools
++    from agents.graph.state import AgentState
++    node_module = importlib.import_module('agents.graph.nodes.create_quote_node')
++    _, quote_id, manager_id = seed_quote(database)
++    monkeypatch.setattr(quote_tools, 'SessionLocal', database)
++    llm = Mock()
++    llm.bind_tools.return_value = llm
++    llm.invoke.return_value = AIMessage(content='', tool_calls=[{'name': 'apply_discount_to_quote', 'args': {'quote_id': str(quote_id), 'discount_percent': 20}, 'id': 'discount'}])
++    monkeypatch.setattr(node_module, 'get_llm', lambda: llm)
++    builder = StateGraph(AgentState)
++    builder.add_node('quote', node_module.create_quote_node)
++    builder.set_entry_point('quote'); builder.add_edge('quote', END)
++    graph = builder.compile(checkpointer=MemorySaver())
++    config = {'configurable': {'thread_id': 'actual-thread-not-request-id'}}
++    initial = {'request_id': str(uuid4()), 'user_input': 'apply a 20% discount', 'entities': {}, 'messages': []}
++    paused = graph.invoke(initial, config)
++    approval_id = paused['__interrupt__'][0].value['approval_id']
++    assert graph.get_state(config).next == ('quote',)
++    from uuid import UUID
++    with database() as db:
++        record = db.get(ApprovalRequest, UUID(approval_id))
++        assert record.action_payload['thread_id'] == config['configurable']['thread_id']
++        quote = db.get(Quote, quote_id)
++        assert quote.total == Decimal('100')
++        assert quote.approval_id == record.id
++        ApprovalRepository(db).resolve(record.id, 'approved' if approved else 'rejected', manager_id)
++    result = graph.invoke(Command(resume={'approved': approved, 'approval_id': approval_id}), config)
++    assert result['approval_decision'] == ('approved' if approved else 'rejected')
++    assert not graph.get_state(config).next
++    assert llm.invoke.call_count == 1
++    with database() as db:
++        assert db.query(ApprovalRequest).count() == 1
++        quote = db.get(Quote, quote_id)
++        assert quote.total == (Decimal('80') if approved else Decimal('100'))
++        assert quote.status == 'approved'
++
++
++def test_invalid_task_target_does_not_choose_first_customer(database):
++    customer_id, quote_id, _ = seed_quote(database)
++    future = datetime.now(timezone.utc) + timedelta(days=2)
++    with database() as db:
++        with pytest.raises(ValidationError):
++            create_followup(db, 'manual_reminder', future, 'Ahmed')
++        with pytest.raises(NotFoundError):
++            create_followup(db, 'manual_reminder', future, uuid4())
++        with pytest.raises(ValidationError):
++            create_followup(db, 'manual_reminder', 'next Tuesday', customer_id)
++        with pytest.raises(ValidationError):
++            create_followup(db, 'manual_reminder', future.replace(tzinfo=None), customer_id)
++        assert db.query(FollowupTask).count() == 0
++        task = create_followup(db, 'quote_followup', future, customer_id, quote_id)
++        assert task.customer_id == customer_id
++
++
++def test_task_claim_is_conditional_and_stale_work_is_not_requeued(database):
++    customer_id, _, _ = seed_quote(database)
++    with database() as db:
++        repo = FollowupRepository(db)
++        task = repo.create('manual_reminder', datetime.now(timezone.utc), customer_id)
++        task_id = task.id
++        assert repo.mark_in_progress(task_id) is not None
++    with database() as db:
++        repo = FollowupRepository(db)
++        assert repo.mark_in_progress(task_id) is None
++        task = db.get(FollowupTask, task_id)
++        assert task.attempt_count == 1
++        task.started_at = datetime.now(timezone.utc) - timedelta(hours=1)
++        db.commit()
++        assert repo.get_due_tasks() == []
++        db.refresh(task)
++        assert task.status == 'failed'
++
++
++def test_duplicate_product_demand_and_ambiguous_mutation(database, monkeypatch):
++    from agents.tools import inventory_tools
++    seed_quote(database)
++    monkeypatch.setattr(inventory_tools, 'SessionLocal', database)
++    result = inventory_tools.check_fulfillment_feasibility.invoke({'items': '[{"product_id":"P-1","quantity":6},{"product_id":"Paper","quantity":6}]'})
++    assert 'NOT FEASIBLE' in result
++    assert 'Error' in inventory_tools.check_fulfillment_feasibility.invoke({'items': '[{"product_id":"P-1","quantity":1.9}]'})
++    with database() as db:
++        db.add(Product(id=uuid4(), sku='P-2', name='Paper Premium', category='Office', unit_price=200, stock_quantity=20, reorder_threshold=2)); db.commit()
++    assert 'Ambiguous' in inventory_tools.update_inventory.invoke({'product_id': 'Paper', 'change_quantity': 5})
++    with database() as db:
++        assert db.query(Product).filter_by(sku='P-1').one().stock_quantity == 10
++
++
++def test_invoice_balance_api_and_tool_agree(database, monkeypatch):
++    customer_id, _, _ = seed_quote(database)
++    with database() as db:
++        invoice = Invoice(id=uuid4(), invoice_id='INV-1', customer_id=customer_id, amount=100, issue_date=date.today(), due_date=date.today()-timedelta(days=3), status='partially_paid')
++        db.add(invoice); db.flush()
++        db.add(Payment(invoice_id=invoice.id, amount=40, method='cash')); db.commit()
++        invoice_id = invoice.id
++    from backend.app.api.routes.invoices import _format_invoice, list_overdue_invoices
++    from agents.tools import invoice_tools
++    monkeypatch.setattr(invoice_tools, 'SessionLocal', database)
++    with database() as db:
++        invoice = InvoiceRepository(db).get_with_payments('INV-1')
++        assert outstanding_balance(invoice) == Decimal('60')
++        assert _format_invoice(invoice)['amount_due'] == 60
++        assert len(list_overdue_invoices(None, db, {})) == 1
++        invoice.status = 'cancelled'; db.commit()
++        service = InvoiceService(InvoiceRepository(db), PaymentRepository(db))
++        with pytest.raises(ValidationError):
++            service.record_payment(invoice_id, Decimal('1'), 'cash')
++    assert 'not overdue' in invoice_tools.get_days_overdue.invoke({'invoice_id': 'INV-1'})
++
++
++def test_success_prose_is_not_evidence_of_communication(database):
++    customer_id, _, _ = seed_quote(database)
++    with database() as db:
++        with pytest.raises(ValueError):
++            require_logged_communication({'response': 'Email sent!', 'action_results': []}, db, customer_id)
++        with pytest.raises(ValueError):
++            require_logged_communication({'error': 'tool failed'}, db, customer_id)
++
++
++def test_every_registered_tool_has_a_workflow_binding():
++    from agents.tools import ALL_TOOLS
++    getters = [('check_inventory_node','_get_tools_for_inventory'), ('check_invoice_node','_get_tools_for_invoice'),
++               ('customer_mgmt_node','_get_tools_for_customer'), ('followup_node','_get_tools_for_followup'),
++               ('create_quote_node','_get_tools_for_quote'), ('resolve_issue_node','_get_tools_for_issue')]
++    bound = {tool.name for module, getter in getters for tool in getattr(importlib.import_module('agents.graph.nodes.'+module), getter)()}
++    assert {tool.name for tool in ALL_TOOLS} == bound
+diff --git a/scripts/seed_audit_verification.py b/scripts/seed_audit_verification.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/seed_audit_verification.py
+@@ -0,0 +1,56 @@
++"""Create fresh, disposable fixtures in a LOCAL PostgreSQL database only.
++
++Usage: python -m scripts.seed_audit_verification > audit-fixtures.json
++Never deletes or updates existing business records. IDs are new on each run.
++"""
++import json
++from datetime import date, timedelta
++from decimal import Decimal
++from uuid import uuid4
++from sqlalchemy.engine import make_url
++from backend.app.core.config import settings
++from backend.app.db.database import SessionLocal
++from backend.app.db.models import User, Customer, Product, Quote, QuoteItem, Invoice, Payment, Order, OrderItem
++
++
++def main():
++    url = make_url(settings.DATABASE_URL)
++    if url.host not in {"localhost", "127.0.0.1", "::1"} or not url.drivername.startswith("postgresql"):
++        raise SystemExit("Refusing to seed: DATABASE_URL must point to local PostgreSQL (localhost/127.0.0.1/::1).")
++    token = uuid4().hex[:8]
++    result = {}
++    with SessionLocal() as db:
++        for role in ("manager", "staff"):
++            row = User(id=uuid4(), email=f"audit-{role}-{token}@example.invalid", full_name=f"Audit {role}",
++                       role=role, is_active=True, hashed_password="demo-header-identity-no-login")
++            db.add(row)
++            result[role + "_id"] = str(row.id)
++        customer = Customer(id=uuid4(), name=f"Audit Ahmed {token}", notes="Regular customer tier.")
++        preferred = Customer(id=uuid4(), name=f"Audit Preferred {token}", notes="Preferred customer tier - approved for up to 15% discount.")
++        product = Product(id=uuid4(), sku=f"AUDIT-{token}", name=f"Audit Paper {token}", category="Office",
++                          unit_price=100, stock_quantity=100, reorder_threshold=10)
++        db.add_all([customer, preferred, product]); db.flush()
++        result.update(customer_id=str(customer.id), preferred_id=str(preferred.id), product_id=str(product.id), sku=product.sku)
++        for label, owner in [("quote", customer), ("reject_quote", customer), ("preferred_quote", preferred)]:
++            quote = Quote(id=uuid4(), quote_number=f"AUDIT-{label}-{token}", customer_id=owner.id, status="approved",
++                          subtotal=100, total=100, discount_percent=0, discount_amount=0)
++            db.add(quote); db.flush()
++            db.add(QuoteItem(id=uuid4(), quote_id=quote.id, product_id=product.id, quantity=1, unit_price=100, line_total=100))
++            result[label + "_id"] = str(quote.id)
++        invoice = Invoice(id=uuid4(), invoice_id=f"AUDIT-INV-{token}", customer_id=customer.id,
++                          amount=100, status="partially_paid", issue_date=date.today()-timedelta(days=10), due_date=date.today()-timedelta(days=3))
++        paid = Invoice(id=uuid4(), invoice_id=f"AUDIT-PAID-{token}", customer_id=customer.id,
++                       amount=100, status="paid", issue_date=date.today()-timedelta(days=10), due_date=date.today()-timedelta(days=3), paid_date=date.today())
++        order = Order(id=uuid4(), order_number=f"AUDIT-ORD-{token}", customer_id=customer.id, status="pending", subtotal=200, total=200)
++        db.add_all([invoice, paid, order]); db.flush()
++        db.add_all([Payment(id=uuid4(), invoice_id=invoice.id, amount=Decimal("40"), method="cash"),
++                    Payment(id=uuid4(), invoice_id=paid.id, amount=Decimal("100"), method="cash"),
++                    OrderItem(id=uuid4(), order_id=order.id, product_id=product.id, quantity=2, unit_price=100, line_total=200)])
++        result.update(invoice_id=str(invoice.id), invoice_number=invoice.invoice_id, paid_invoice_id=str(paid.id),
++                      order_id=str(order.id), order_number=order.order_number)
++        db.commit()
++    print(json.dumps(result, indent=2))
++
++
++if __name__ == "__main__":
++    main()

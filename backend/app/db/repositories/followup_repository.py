@@ -12,11 +12,11 @@ Methods:
     mark_failed: Marks a task as failed and records the corresponding error message.
 '''
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from uuid import UUID, uuid4
-from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy.orm import Session, joinedload
+from sqlalchemy import select, update, or_
 
 from backend.app.db.models.followup_task import FollowupTask
 
@@ -33,6 +33,7 @@ class FollowupRepository:
         scheduled_at: datetime,
         customer_id: Optional[UUID] = None,
         quote_id: Optional[UUID] = None,
+        status: str = "pending",
     ) -> FollowupTask:
         """Create a new follow-up task."""
         task = FollowupTask(
@@ -41,8 +42,9 @@ class FollowupRepository:
             scheduled_at=scheduled_at,
             customer_id=customer_id,
             quote_id=quote_id,
-            status="pending",
-            attempt_count=0,
+            status=status,
+            attempt_count=1 if status == "in_progress" else 0,
+            started_at=datetime.now(timezone.utc) if status == "in_progress" else None,
             created_at=datetime.now(timezone.utc),
         )
         self.session.add(task)
@@ -62,6 +64,13 @@ class FollowupRepository:
     def get_due_tasks(self, as_of: Optional[datetime] = None) -> list[FollowupTask]:
         """Fetch all pending tasks scheduled at or before `as_of`."""
         now_dt = as_of or datetime.now(timezone.utc)
+        # Never automatically replay work whose side effects may have happened.
+        # Stale claims are failed for explicit review instead of being requeued.
+        self.session.execute(update(FollowupTask).where(
+            FollowupTask.status == "in_progress",
+            or_(FollowupTask.started_at.is_(None), FollowupTask.started_at < now_dt - timedelta(minutes=30)),
+        ).values(status="failed", last_error="Worker did not finish within 30 minutes; review recorded communications before retrying."))
+        self.session.commit()
         stmt = (
             select(FollowupTask)
             .where(
@@ -77,18 +86,20 @@ class FollowupRepository:
         stmt = (
             select(FollowupTask)
             .order_by(FollowupTask.scheduled_at.desc())
+            .options(joinedload(FollowupTask.customer))
             .limit(limit)
         )
         return list(self.session.execute(stmt).scalars().all())
 
     def mark_in_progress(self, task_id: UUID | str) -> Optional[FollowupTask]:
         """Mark task as currently in progress."""
-        task = self.get_by_id(task_id)
-        if not task:
-            return None
-        task.status = "in_progress"
-        task.attempt_count += 1
+        task = self.session.scalars(update(FollowupTask).where(
+            FollowupTask.id == UUID(str(task_id)), FollowupTask.status == "pending"
+        ).values(status="in_progress", attempt_count=FollowupTask.attempt_count + 1, started_at=datetime.now(timezone.utc))
+          .returning(FollowupTask)).one_or_none()
         self.session.commit()
+        if task is None:
+            return None
         self.session.refresh(task)
         return task
 

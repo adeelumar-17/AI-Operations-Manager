@@ -83,9 +83,14 @@ class ApprovalRepository:
         approved_by: Optional[UUID | str] = None,
     ) -> Optional[ApprovalRequest]:
         """Resolve an approval request (approved or rejected)."""
-        approval = self.get_by_id(approval_id)
+        approval = self.session.scalars(select(ApprovalRequest).where(
+            ApprovalRequest.id == UUID(str(approval_id))).with_for_update()).one_or_none()
         if not approval:
             return None
+        if status not in {"approved", "rejected"}:
+            raise ValueError("Invalid approval decision.")
+        if approval.status not in {"pending", status}:
+            raise ValueError("Approval already has a different decision.")
 
         # Safely convert approved_by to a valid User UUID if exists, else None
         user_uuid: Optional[UUID] = None
@@ -103,19 +108,19 @@ class ApprovalRepository:
                 if not self.session.get(User, user_uuid):
                     user_uuid = None
 
+        if user_uuid is None:
+            raise ValueError("An existing manager identity is required.")
+        reviewer = self.session.get(User, user_uuid)
+        if not reviewer.is_active or reviewer.role not in {"manager", "admin"}:
+            raise ValueError("An active manager or admin is required.")
+        if approval.status == status:
+            return approval
         approval.status = status
         approval.approved_by = user_uuid
         approval.resolved_at = datetime.now(timezone.utc)
 
-        # Synchronize linked Quotes status to match approval resolution
-        from backend.app.db.models.quote import Quote
-        linked_quotes = self.session.query(Quote).filter(Quote.approval_id == approval.id).all()
-        for q in linked_quotes:
-            if status == "approved":
-                q.status = "approved"
-            elif status == "rejected":
-                q.status = "rejected"
-
+        # The resumed workflow executes the saved proposal; a decision alone is
+        # not proof that the business mutation completed.
         self.session.commit()
         self.session.refresh(approval)
         return approval

@@ -71,6 +71,9 @@ class OrderService:
                 f"Cannot move order from {order.status} to {new_status}."
             )
 
+        if new_status == "processing":
+            return self.fulfill_order(order_id)
+
         order.status = new_status
         now = datetime.now(timezone.utc)
 
@@ -125,5 +128,3 @@ class OrderService:
             (item.line_total for item in items),
             Decimal("0.00"),
         )
-
-

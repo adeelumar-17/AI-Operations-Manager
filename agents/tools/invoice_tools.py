@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 '''
 what the file does?
 This module provides LangChain-compatible invoice and billing tools for the operations agent, wrapping InvoiceService to query invoice details, list overdue customer invoices, and compute days overdue.
@@ -13,18 +15,19 @@ Methods:
 '''
 
 from datetime import date
-from decimal import Decimal
+
 from typing import Annotated
 from uuid import UUID
 
 from langchain_core.tools import tool
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from backend.app.db.database import SessionLocal
 from backend.app.db.models.invoice import Invoice
 from backend.app.db.repositories.invoice_repository import InvoiceRepository
 from backend.app.db.repositories.payment_repository import PaymentRepository
-from backend.app.services.invoice_service import InvoiceService, calculate_days_overdue
+from backend.app.services.invoice_service import InvoiceService, calculate_days_overdue, outstanding_balance, calculate_total_paid
 
 
 def _make_invoice_service() -> tuple[InvoiceService, object]:
@@ -46,12 +49,14 @@ def get_invoice(
     """
     service, session = _make_invoice_service()
     try:
-        invoice = service.get_invoice(UUID(invoice_id))
+        invoice = service.get_invoice(invoice_id)
         days_overdue = calculate_days_overdue(invoice.due_date, date.today())
         lines = [
             f"Invoice: {invoice.invoice_id}",
+            f"  UUID: {invoice.id}",
             f"  Status: {invoice.status}",
             f"  Amount: ${invoice.amount}",
+            f"  Paid: ${calculate_total_paid(invoice.payments)} | Outstanding: ${outstanding_balance(invoice)}",
             f"  Issue date: {invoice.issue_date}",
             f"  Due date: {invoice.due_date}",
         ]
@@ -65,6 +70,7 @@ def get_invoice(
                 lines.append(f"    - ${p.amount} via {p.method or 'unknown'} on {p.paid_at.date()}")
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error retrieving invoice: {e}"
     finally:
         session.close()
@@ -87,6 +93,7 @@ def find_overdue_invoices(
         today = date.today()
         stmt = (
             select(Invoice)
+            .options(selectinload(Invoice.payments))
             .where(Invoice.status.in_(["sent", "partially_paid", "overdue"]))
             .where(Invoice.due_date < today)
             .order_by(Invoice.due_date)
@@ -101,14 +108,17 @@ def find_overdue_invoices(
 
         lines = [f"Overdue invoices ({len(invoices)}):"]
         for inv in invoices:
+            if outstanding_balance(inv) <= 0:
+                continue
             days = calculate_days_overdue(inv.due_date, today)
             lines.append(
-                f"  - {inv.invoice_id} | Customer: {inv.customer_id} | "
-                f"Amount: ${inv.amount} | Due: {inv.due_date} | "
+                f"  - {inv.invoice_id} | UUID: {inv.id} | Customer: {inv.customer_id} | "
+                f"Outstanding: ${outstanding_balance(inv)} | Due: {inv.due_date} | "
                 f"Days overdue: {days}"
             )
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error finding overdue invoices: {e}"
     finally:
         session.close()
@@ -126,12 +136,13 @@ def get_days_overdue(
     """
     service, session = _make_invoice_service()
     try:
-        days = service.get_days_overdue(UUID(invoice_id), date.today())
-        invoice = service.get_invoice(UUID(invoice_id))
+        invoice = service.get_invoice(invoice_id)
+        days = calculate_days_overdue(invoice.due_date, date.today()) if invoice.status not in {"paid", "cancelled", "draft"} and outstanding_balance(invoice) > 0 else 0
         if days == 0:
             return f"Invoice {invoice.invoice_id} is not overdue (due: {invoice.due_date})."
         return f"Invoice {invoice.invoice_id} is {days} day(s) overdue (due: {invoice.due_date})."
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error calculating days overdue: {e}"
     finally:
         session.close()

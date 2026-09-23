@@ -41,6 +41,8 @@ class InvoiceService:
         as_of: date,
     ) -> int:
         invoice = self.get_invoice(invoice_id)
+        if invoice.status in {"paid", "cancelled", "draft"} or outstanding_balance(invoice) == 0:
+            return 0
         return calculate_days_overdue(invoice.due_date, as_of)
 
     def refresh_status(
@@ -75,10 +77,14 @@ class InvoiceService:
         paid_at: datetime | None = None,
         as_of: date | None = None,
     ):
-        if amount <= Decimal("0"):
+        if not amount.is_finite() or amount <= Decimal("0"):
             raise ValidationError("Payment amount must be greater than zero.")
+        if amount != amount.quantize(Decimal("0.01")):
+            raise ValidationError("Payment must have at most two decimal places.")
 
         invoice = self.get_invoice(invoice_id)
+        if invoice.status == "cancelled":
+            raise ValidationError("Cannot record payment on a cancelled invoice.")
         total_paid = calculate_total_paid(invoice.payments)
 
         if total_paid + amount > invoice.amount:
@@ -107,6 +113,12 @@ def calculate_total_paid(
         (payment.amount for payment in payments),
         Decimal("0.00"),
     )
+
+
+def outstanding_balance(invoice) -> Decimal:
+    if invoice.status in {"paid", "cancelled"}:
+        return Decimal("0.00")
+    return max(invoice.amount - calculate_total_paid(invoice.payments), Decimal("0.00"))
 
 
 def calculate_days_overdue(
@@ -149,4 +161,3 @@ def calculate_invoice_status(
         return "partially_paid"
 
     return "sent"
-

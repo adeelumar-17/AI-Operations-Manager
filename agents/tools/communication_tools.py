@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 '''
 what the file does?
 This module provides LangChain-compatible communication tracking tools for the operations agent, delegating to CommunicationService to record inbound/outbound interactions (emails, calls, notes, SMS) and retrieve communication history.
@@ -71,6 +73,7 @@ def log_communication(
             f"  Status: {comm.status}"
         )
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error logging communication: {e}"
     finally:
         session.close()
@@ -94,6 +97,7 @@ def get_communication_history(
         comms = service.get_communication_history(
             customer_id=UUID(customer_id),
             communication_type=communication_type or None,
+            limit=limit,
         )
         if not comms:
             return f"No communications found for customer {customer_id}."
@@ -103,10 +107,11 @@ def get_communication_history(
         for c in recent:
             lines.append(
                 f"  [{c.created_at.date()}] {c.type.upper()} ({c.direction}) — "
-                f"{c.subject or '(no subject)'} | Status: {c.status}"
+                f"{c.subject or '(no subject)'} | Status: {c.status} | UUID: {c.id} | Body: {c.body or ''}"
             )
         return "\n".join(lines)
     except Exception as e:
+        logger.exception('Operation failed')
         return f"Error retrieving communication history: {e}"
     finally:
         session.close()

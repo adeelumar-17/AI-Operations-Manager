@@ -25,3 +25,13 @@ class InsufficientStockError(ServiceError):
 
 class InvalidStatusTransitionError(ServiceError):
     """Raised when an entity cannot move to the requested status."""
+
+
+class ApprovalRequired(ServiceError):
+    """A validated proposed action that must be reviewed before execution."""
+
+    def __init__(self, action_type: str, payload: dict, reason: str):
+        super().__init__(reason)
+        self.action_type = action_type
+        self.payload = payload
+        self.reason = reason

@@ -12,7 +12,8 @@ Methods:
 '''
 
 from typing import Generator, Optional
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
+from uuid import UUID
 from sqlalchemy.orm import Session
 
 from backend.app.db.database import SessionLocal
@@ -30,23 +31,32 @@ def get_db() -> Generator[Session, None, None]:
 def get_current_user(
     x_user_id: Optional[str] = Header(None, alias="X-User-Id", description="User ID"),
     x_user_role: Optional[str] = Header("operator", alias="X-User-Role", description="User role (admin, manager, operator)"),
+    db: Session = Depends(get_db),
 ) -> dict:
-    """Extract authenticated user info from request headers."""
-    return {
-        "user_id": x_user_id or "anonymous-operator",
-        "role": (x_user_role or "operator").lower(),
-    }
+    """Demo identity only: validate the ID and derive roles from the database.
+
+    X-User-Id is intentionally not authentication. X-User-Role is accepted for
+    compatibility but never trusted for authorization.
+    """
+    from backend.app.db.models.user import User
+    try:
+        user = db.get(User, UUID(x_user_id or ""))
+    except (ValueError, TypeError):
+        user = None
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=401, detail="Provide X-User-Id for an active demo user.")
+    identity = {"user_id": str(user.id), "role": user.role}
+    db.rollback()  # release the read transaction before any long-running agent work
+    return identity
 
 
 def require_role(allowed_roles: list[str]):
     """Enforce endpoint access control based on user role."""
-    def role_checker(current_user: dict = Header(None)) -> dict:
-        user = current_user or {"role": "operator"}
-        role = user.get("role", "operator")
-        if role not in allowed_roles:
+    def role_checker(current_user: dict = Depends(get_current_user)) -> dict:
+        if current_user["role"] not in allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access forbidden: role '{role}' is not in allowed roles {allowed_roles}.",
+                detail="An active authorized user is required.",
             )
-        return user
+        return current_user
     return role_checker

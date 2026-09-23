@@ -13,7 +13,7 @@ Methods:
 from uuid import UUID
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, selectinload, joinedload
 
 from backend.app.db.models.quote import Quote
 from backend.app.db.models.quote_item import QuoteItem
@@ -27,16 +27,21 @@ class QuoteRepository:
         return self.session.get(Quote, quote_id)
 
     def list_all(self, status: str | None = None) -> list[Quote]:
-        statement = select(Quote).options(selectinload(Quote.items)).order_by(Quote.created_at.desc())
+        statement = select(Quote).options(selectinload(Quote.items), joinedload(Quote.customer)).order_by(Quote.created_at.desc())
         if status and status != "all":
             statement = statement.where(Quote.status == status)
         return list(self.session.scalars(statement).all())
 
     def get_with_items(self, quote_id: UUID) -> Quote | None:
+        try:
+            predicate = Quote.id == UUID(str(quote_id))
+        except ValueError:
+            predicate = Quote.quote_number == str(quote_id)
         statement = (
             select(Quote)
-            .where(Quote.id == quote_id)
+            .where(predicate)
             .options(selectinload(Quote.items))
+            .with_for_update()
         )
         return self.session.scalars(statement).one_or_none()
 

@@ -1,3 +1,5 @@
+import logging
+logger = logging.getLogger(__name__)
 '''
 what the file does?
 This module implements the identify_entities graph node, which extracts structured domain entities (customer IDs/names, product SKUs, quantities, monetary values, dates) from user requests using LLM-driven JSON extraction.
@@ -37,11 +39,11 @@ def identify_entities(state: AgentState) -> dict:
     if not user_input:
         return {"entities": {}}
 
-    llm = _get_llm()
     prompt = ENTITY_EXTRACTION_PROMPT.format(user_input=user_input)
 
     try:
-        response = llm.invoke(prompt)
+        llm = _get_llm()
+        response = llm.invoke([*state.get("messages", [])[-20:], ("human", prompt)])
         raw = response.content.strip()
 
         # Extract JSON from the response (handle markdown code blocks)
@@ -56,6 +58,7 @@ def identify_entities(state: AgentState) -> dict:
         return {"entities": entities}
 
     except Exception as e:
+        logger.exception('Operation failed')
         # Non-fatal — the workflow nodes will ask for clarification if they
         # need an entity that's missing
-        return {"entities": {}, "error": f"Entity extraction warning: {e}"}
+        return {"entities": {}}

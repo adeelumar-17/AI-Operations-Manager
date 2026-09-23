@@ -10,16 +10,23 @@ Methods:
 '''
 
 from uuid import UUID
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from backend.app.api.dependencies import get_db, get_current_user
+from backend.app.api.dependencies import get_db, get_current_user, require_role
 from backend.app.schemas.approval import ApprovalResponse, ApprovalDecisionRequest
 from backend.app.schemas.chat import ChatResponse
 from backend.app.services.approval_service import ApprovalService
 from agents.agent_service import resume_agent
 
 router = APIRouter(prefix="/approvals", tags=["Approvals"])
+
+
+def _resume(**kwargs):
+    try:
+        return resume_agent(**kwargs)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("", response_model=list[ApprovalResponse])
@@ -51,7 +58,7 @@ def approve_action(
     approval_id: UUID,
     req: ApprovalDecisionRequest = ApprovalDecisionRequest(),
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_role(["manager", "admin"])),
 ):
     """Approve a pending action and resume the agent graph to finalize it."""
     service = ApprovalService(db)
@@ -59,22 +66,18 @@ def approve_action(
     if not approval:
         raise HTTPException(status_code=404, detail="Approval request not found.")
 
-    if approval.status != "pending":
+    if approval.status not in {"pending", "approved"}:
         raise HTTPException(
             status_code=400,
             detail=f"Approval request is already resolved with status '{approval.status}'.",
         )
 
-    service.approve(
-        approval_id,
-        approved_by=req.approved_by or current_user.get("user_id"),
-    )
-
-    res = resume_agent(
+    db.rollback()  # resume opens its own short business transactions
+    res = _resume(
         approval_id=str(approval_id),
         approved=True,
         comment=req.comment,
-        reviewer_id=req.approved_by or current_user.get("user_id"),
+        reviewer_id=current_user["user_id"],
     )
 
     return ChatResponse(
@@ -96,7 +99,7 @@ def reject_action(
     approval_id: UUID,
     req: ApprovalDecisionRequest = ApprovalDecisionRequest(),
     db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
+    current_user: dict = Depends(require_role(["manager", "admin"])),
 ):
     """Reject a pending action and resume the agent graph with rejection."""
     service = ApprovalService(db)
@@ -104,22 +107,18 @@ def reject_action(
     if not approval:
         raise HTTPException(status_code=404, detail="Approval request not found.")
 
-    if approval.status != "pending":
+    if approval.status not in {"pending", "rejected"}:
         raise HTTPException(
             status_code=400,
             detail=f"Approval request is already resolved with status '{approval.status}'.",
         )
 
-    service.reject(
-        approval_id,
-        approved_by=req.approved_by or current_user.get("user_id"),
-    )
-
-    res = resume_agent(
+    db.rollback()
+    res = _resume(
         approval_id=str(approval_id),
         approved=False,
         comment=req.comment,
-        reviewer_id=req.approved_by or current_user.get("user_id"),
+        reviewer_id=current_user["user_id"],
     )
 
     return ChatResponse(

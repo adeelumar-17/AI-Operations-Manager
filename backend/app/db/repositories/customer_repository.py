@@ -23,7 +23,7 @@ class CustomerRepository:
         statement = select(Customer).order_by(Customer.name).limit(limit)
         return list(self.session.scalars(statement).all())
 
-    def search(self, query: str) -> list[Customer]:
+    def search(self, query: str, limit: int | None = None) -> list[Customer]:
         statement = (
             select(Customer)
             .where(
@@ -36,6 +36,8 @@ class CustomerRepository:
             .order_by(Customer.name)
         )
 
+        if limit is not None:
+            statement = statement.limit(limit)
         return list(self.session.scalars(statement).all())
 
     def get_by_id(self, customer_id: UUID) -> Customer | None:
