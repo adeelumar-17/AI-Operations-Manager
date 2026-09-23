@@ -30,14 +30,16 @@ def test_api_endpoints():
     print(f"✓ OpenAPI schema verified: {len(paths)} endpoints mounted.")
 
     # 3. Tasks trigger endpoint
-    res = client.post("/api/v1/tasks/trigger")
+    manager_headers = {"X-User-Id": "36ae02ac-133d-4ff0-969c-b879d2eb2820"}
+    res = client.post("/api/v1/tasks/trigger", headers=manager_headers)
     assert res.status_code == 200
     print(f"✓ POST /api/v1/tasks/trigger: {res.json()}")
 
     # 4. Chat endpoint
     prompt = "Can we fulfill an order of 50 units of SKU-1234?"
     print(f"\n[Testing POST /api/v1/chat with: '{prompt}']")
-    res = client.post("/api/v1/chat", json={"message": prompt})
+    res = client.post("/api/v1/chat", json={"message": prompt}, headers=manager_headers)
+
     assert res.status_code == 200, f"Chat failed: {res.status_code} - {res.text}"
     chat_data = res.json()
     print(f"✓ Chat workflow: {chat_data.get('workflow')}")
