@@ -12,6 +12,7 @@ Methods:
 '''
 
 from typing import Optional, Any
+import os
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 
@@ -43,6 +44,8 @@ def get_checkpointer(
         return _checkpointer_instance
 
     if force_memory or not POSTGRES_SAVER_AVAILABLE:
+        if not force_memory and os.getenv("VERCEL") == "1":
+            raise RuntimeError("Persistent PostgreSQL checkpointing is required on Vercel.")
         _checkpointer_instance = MemorySaver()
         return _checkpointer_instance
 
@@ -53,19 +56,24 @@ def get_checkpointer(
         # Normalize SQLAlchemy dialect prefix (postgresql+psycopg://) to libpq format (postgresql://)
         conn_info = raw_url.replace("postgresql+psycopg://", "postgresql://")
         if not conn_info:
+            if os.getenv("VERCEL") == "1":
+                raise ValueError("DATABASE_URL is required for durable checkpoints.")
             _checkpointer_instance = MemorySaver()
             return _checkpointer_instance
 
         connection_kwargs = {"autocommit": True, "row_factory": dict_row}
         _pool = ConnectionPool(
             conninfo=conn_info,
-            max_size=10,
+            min_size=0 if os.getenv("VERCEL") == "1" else 4,
+            max_size=4 if os.getenv("VERCEL") == "1" else 10,
             kwargs=connection_kwargs,
             open=True,
         )
         _checkpointer_instance = PostgresSaver(_pool)
         return _checkpointer_instance
     except Exception as exc:
+        if os.getenv("VERCEL") == "1":
+            raise RuntimeError("Could not initialize persistent PostgreSQL checkpointing on Vercel.") from exc
         print(f"[Warning] Failed to initialize PostgresSaver: {exc}. Falling back to MemorySaver.")
         _checkpointer_instance = MemorySaver()
         return _checkpointer_instance

@@ -1,5 +1,6 @@
 """Claim due tasks once and verify follow-up records before completion."""
 import logging
+import os
 from backend.app.db.database import SessionLocal
 from backend.app.db.repositories.followup_repository import FollowupRepository
 from backend.app.services.execution_service import require_logged_communication
@@ -12,7 +13,10 @@ def process_due_followups() -> int:
     processed = 0
     try:
         with SessionLocal() as db:
-            task_ids = [task.id for task in FollowupRepository(db).get_due_tasks()]
+            repo = FollowupRepository(db)
+            # Vercel requests have a finite duration. Leave the remaining queue pending.
+            due = repo.get_due_tasks(limit=1) if os.getenv("VERCEL") == "1" else repo.get_due_tasks()
+            task_ids = [task.id for task in due]
         for task_id in task_ids:
             try:
                 with SessionLocal() as db:

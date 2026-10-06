@@ -35,7 +35,8 @@ class Settings(BaseSettings):
             v = "postgresql+psycopg://" + v[len("postgresql://"):]
         return v
 
-    # Embedding backend: 'sentence-transformers' (local, free) | 'openai'
+    # 'onnx' uses the same MiniLM/384-dimensional model without PyTorch.
+    # Vercel's entrypoint supplies EMBEDDING_BACKEND=onnx before Settings loads.
     EMBEDDING_BACKEND: str = "sentence-transformers"
     SENTENCE_TRANSFORMERS_MODEL: str = "all-MiniLM-L6-v2"  # 384 dims
 

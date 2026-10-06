@@ -25,7 +25,7 @@ from backend.app.scheduler.scheduler import start_scheduler, stop_scheduler
 # When SCHEDULER_ENABLED=false the in-process APScheduler is skipped.
 # Use this on Lambda where a persistent background thread cannot survive
 # between invocations — EventBridge hits /internal/run-followups instead.
-_SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
+_SCHEDULER_ENABLED = os.getenv("VERCEL") != "1" and os.getenv("SCHEDULER_ENABLED", "true").lower() == "true"
 
 
 @asynccontextmanager
@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             print(f"[Warning] Could not start scheduler: {exc}")
     else:
-        print("[Info] APScheduler disabled (SCHEDULER_ENABLED=false). Using EventBridge trigger.")
+        print("[Info] APScheduler disabled. Follow-ups require the protected HTTP trigger.")
     yield
     if _SCHEDULER_ENABLED:
         try:

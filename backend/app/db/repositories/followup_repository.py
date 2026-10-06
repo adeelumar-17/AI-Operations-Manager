@@ -61,7 +61,7 @@ class FollowupRepository:
                 return None
         return self.session.get(FollowupTask, task_id)
 
-    def get_due_tasks(self, as_of: Optional[datetime] = None) -> list[FollowupTask]:
+    def get_due_tasks(self, as_of: Optional[datetime] = None, limit: Optional[int] = None) -> list[FollowupTask]:
         """Fetch all pending tasks scheduled at or before `as_of`."""
         now_dt = as_of or datetime.now(timezone.utc)
         # Never automatically replay work whose side effects may have happened.
@@ -79,6 +79,10 @@ class FollowupRepository:
             )
             .order_by(FollowupTask.scheduled_at.asc())
         )
+        if limit is not None:
+            if limit < 1:
+                raise ValueError("Due-task limit must be positive.")
+            stmt = stmt.limit(limit)
         return list(self.session.execute(stmt).scalars().all())
 
     def list_all(self, limit: int = 50) -> list[FollowupTask]:

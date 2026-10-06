@@ -8,6 +8,7 @@ If you change the model, run a new Alembic migration to update the column dimens
 and re-ingest all documents.
 
 Supported backends:
+  - 'onnx': same local MiniLM model and 384-dim vectors, without PyTorch
   - 'sentence-transformers' (default): local, free, 384-dim
   - 'openai': requires OPENAI_API_KEY, 1536-dim (needs schema migration to use)
 """
@@ -35,6 +36,9 @@ def embed_text(text: str) -> list[float]:
 
     if backend == "openai":
         return _embed_with_openai(text)
+    elif backend == "onnx":
+        from rag.onnx_embeddings import embed
+        return embed(text)
     else:
         return _embed_with_sentence_transformers(text)
 
@@ -60,8 +64,9 @@ def _get_embedding_backend() -> str:
     1. EMBEDDING_BACKEND environment variable
     2. Falls back to 'sentence-transformers'
     """
-    backend = os.getenv("EMBEDDING_BACKEND", "sentence-transformers").lower()
-    if backend in ("openai", "sentence-transformers"):
+    default = "onnx" if os.getenv("VERCEL") == "1" else "sentence-transformers"
+    backend = os.getenv("EMBEDDING_BACKEND", default).lower()
+    if backend in ("openai", "sentence-transformers", "onnx"):
         return backend
     return "sentence-transformers"
 

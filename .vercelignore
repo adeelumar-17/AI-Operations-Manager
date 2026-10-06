@@ -1,0 +1,10 @@
+.env
+.env.*
+.venv/
+.venv-vercel/
+.cache/
+.git/
+.pytest_cache/
+backend/tests/
+agents/tests/
+AUDIT_CHANGES.diff

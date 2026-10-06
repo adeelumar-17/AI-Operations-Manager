@@ -289,6 +289,8 @@ The application runs natively as a Python ASGI service without any Docker requir
 
 ### 1. Render Deployment
 
+For the lightweight Vercel backend deployment (Python 3.12, ONNX embeddings and HTTP-triggered follow-ups), use [VERCEL_DEPLOYMENT.md](VERCEL_DEPLOYMENT.md). Vercel installs the locked `pyproject.toml` profile; the existing `requirements.txt` profile continues to support local/Render sentence-transformers deployments.
+
 1. **Connect Repository**: Link your GitHub repository in the [Render Dashboard](https://dashboard.render.com).
 2. **Create a Web Service**:
    - **Environment**: `Python 3`

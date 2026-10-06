@@ -49,3 +49,6 @@ logs/
 
 # ── Sentence-transformers model cache ─────────────────────────────────────────
 .cache/
+models/minilm/
+.venv-vercel/
+.vercel/
