@@ -7,7 +7,7 @@ Use a separate Vercel project for this backend repository. The frontend remains 
 1. Import this repository from GitHub, with the repository root as Root Directory.
 2. Select the **FastAPI** framework preset. Python **3.12** is specified in `pyproject.toml`.
 3. Leave Install Command and Build Command at their detected defaults. The configured build is `python -m scripts.prepare_vercel_model`; if the dashboard overrides it, set that exact Build Command.
-4. Enable **Fluid Compute** and use the Hobby 300-second function duration in `vercel.json`. Do not copy Render's Uvicorn Start Command into Vercel.
+4. `vercel.json` explicitly enables **Fluid Compute** and sets the Hobby 300-second function duration; no dashboard toggle is needed. Do not copy Render's Uvicorn Start Command into Vercel.
 5. Vercel resolves the lightweight `pyproject.toml`/`uv.lock` dependencies. Do not override installation with `pip install -r requirements.txt`: that older profile includes PyTorch for local/Render compatibility.
 
 The build downloads a pinned, unquantized ONNX export of **the same all-MiniLM-L6-v2 model** and its tokenizer. It smoke-tests 384-dimensional vectors and bundles only inference assets, so chat does not download models during a cold start. Pooling, truncation and normalization match the original model. No database migrations or policy re-ingestion are performed in deployment builds, including previews.

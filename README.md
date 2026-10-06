@@ -109,7 +109,7 @@ AI-Operations-Manager/
 ├── tests/eval/                 # Evaluation dataset (eval_cases.json) and benchmark runner
 ├── requirements.txt            # Python dependencies (CPU torch + psycopg 3)
 ├── Procfile                    # ASGI process specification for Render / Railway
-├── .python-version             # Python runtime specification (3.11.9)
+├── .python-version             # Python runtime specification (3.12)
 └── .env.example                # Environment variables template
 ```
 
