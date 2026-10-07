@@ -1,0 +1,220 @@
+{
+  "verification": "Real Groq and configured PostgreSQL via in-process HTTP TestClient; no LLM or database mocks",
+  "started_at": "2026-10-07T05:20:48.395748+00:00",
+  "steps": [
+    {
+      "step": "1 \u2014 exact creation request",
+      "method": "POST",
+      "path": "/api/v1/chat",
+      "request": {
+        "message": "Create a quote for Ahmed Industries for 20 ergonomic chairs."
+      },
+      "status_code": 200,
+      "response": {
+        "response": "I\u2019ve created a draft quote for Ahmed Industries (Quote\u202f#\u202fQ\u201186DE215863B34CD68F4B35E6C6C7778F, ID\u202f86de2158\u201163b3\u20114cd6\u20118f4b\u201135e6c6c7778f) for 20\u202fErgonomic Mesh Office Chairs at the catalog price of $249.99 each, resulting in a subtotal and total of $4,999.80 with no discount applied. The quote is saved as a draft and ready for your review; let me know if you\u2019d like to add a discount, approve, or make any other changes.",
+        "workflow": "create_quote",
+        "intent": "create_quote",
+        "entities": {
+          "customer_name": "Ahmed Industries",
+          "product_names": [
+            "ergonomic chairs"
+          ],
+          "quantities": [
+            20
+          ]
+        },
+        "approval_required": false,
+        "approval_id": null,
+        "approval_decision": null,
+        "thread_id": "73388e95-11fc-4889-962f-925c40bb6f51",
+        "request_id": "73388e95-11fc-4889-962f-925c40bb6f51",
+        "error": null
+      }
+    },
+    {
+      "step": "2 \u2014 exact 15% request",
+      "method": "POST",
+      "path": "/api/v1/chat",
+      "request": {
+        "message": "Apply a 15% discount to quote 86de2158-63b3-4cd6-8f4b-35e6c6c7778f.",
+        "thread_id": "73388e95-11fc-4889-962f-925c40bb6f51"
+      },
+      "status_code": 200,
+      "response": {
+        "response": "I\u2019ve applied the requested 15\u202f% discount to quote\u202f86de2158\u201163b3\u20114cd6\u20118f4b\u201135e6c6c7778f. The discount amount is $749.97, reducing the total to $4,249.83, and the quote status is now **approved**. Let me know if you\u2019d like to convert this quote to an order or make any further changes.",
+        "workflow": "create_quote",
+        "intent": "create_quote",
+        "entities": {
+          "discount_percent": 15,
+          "quote_id": "86de2158-63b3-4cd6-8f4b-35e6c6c7778f"
+        },
+        "approval_required": false,
+        "approval_id": null,
+        "approval_decision": null,
+        "thread_id": "73388e95-11fc-4889-962f-925c40bb6f51",
+        "request_id": "d468113c-dd1f-4ec2-8a32-af79e136f5d2",
+        "error": null
+      }
+    },
+    {
+      "step": "3 \u2014 approvals after 15%",
+      "method": "GET",
+      "path": "/api/v1/approvals",
+      "request": null,
+      "status_code": 200,
+      "response": []
+    },
+    {
+      "step": "4 \u2014 exact 15% approval",
+      "result": "Not applicable: 15% does not exceed this customer's automatic limit."
+    },
+    {
+      "step": "Supplement \u2014 16% approval request",
+      "method": "POST",
+      "path": "/api/v1/chat",
+      "request": {
+        "message": "Apply a 16% discount to quote 86de2158-63b3-4cd6-8f4b-35e6c6c7778f.",
+        "thread_id": "73388e95-11fc-4889-962f-925c40bb6f51"
+      },
+      "status_code": 200,
+      "response": {
+        "response": "Manager approval required; the operation is paused.",
+        "workflow": "create_quote",
+        "intent": "create_quote",
+        "entities": {
+          "discount_percent": 16,
+          "quote_id": "86de2158-63b3-4cd6-8f4b-35e6c6c7778f"
+        },
+        "approval_required": true,
+        "approval_id": "e824f905-c177-5eb2-b001-a5e3760215bd",
+        "approval_decision": null,
+        "thread_id": "73388e95-11fc-4889-962f-925c40bb6f51",
+        "request_id": "53cebf84-a6b9-48d2-9c41-d38d4c3b9107",
+        "error": null
+      }
+    },
+    {
+      "step": "Supplement \u2014 approvals after 16%",
+      "method": "GET",
+      "path": "/api/v1/approvals",
+      "request": null,
+      "status_code": 200,
+      "response": [
+        {
+          "id": "e824f905-c177-5eb2-b001-a5e3760215bd",
+          "action_type": "quote_discount_approval",
+          "action_payload": {
+            "results": [
+              {
+                "args": {
+                  "query": "maximum discount percentage OfficeHub policy",
+                  "top_k": 5
+                },
+                "tool": "search_business_policy",
+                "result": "Policy search results for: 'maximum discount percentage OfficeHub policy'\n\n[1] OfficeHub Discount Policy (similarity: 0.769)\n    # OfficeHub Discount Policy\n\n[2] OfficeHub Payment Policy (similarity: 0.603)\n    # OfficeHub Payment Policy\n\n[3] OfficeHub Shipping Policy (similarity: 0.570)\n    # OfficeHub Shipping Policy\n\n[4] OfficeHub Return Policy (similarity: 0.559)\n    # OfficeHub Return Policy\n\n[5] OfficeHub Approval Policy (similarity: 0.533)\n    # OfficeHub Approval Policy\n"
+              },
+              {
+                "args": {
+                  "query": "OfficeHub Discount Policy maximum discount",
+                  "top_k": 10
+                },
+                "tool": "search_business_policy",
+                "result": "Policy search results for: 'OfficeHub Discount Policy maximum discount'\n\n[1] OfficeHub Discount Policy (similarity: 0.782)\n    # OfficeHub Discount Policy\n\n[2] OfficeHub Payment Policy (similarity: 0.601)\n    # OfficeHub Payment Policy\n\n[3] OfficeHub Shipping Policy (similarity: 0.569)\n    # OfficeHub Shipping Policy\n\n[4] OfficeHub Return Policy (similarity: 0.556)\n    # OfficeHub Return Policy\n\n[5] OfficeHub Approval Policy (similarity: 0.525)\n    # OfficeHub Approval Policy\n\n[6] OfficeHub Discount Policy (similarity: 0.502)\n    ## Discounts Above the Limit\n\n\nAny discount above the customer's normal limit requires manager approval before the quotation is sent to the customer.\n\n[7] OfficeHub Discount Policy (similarity: 0.455)\n    ## Maximum Discount\n\n\nNo customer may receive a discount greater than 25%.\n\n[8] OfficeHub Approval Policy (similarity: 0.454)\n    ## Discount Approvals\n\n\nAny discount above 10% for regular customers or 15% for preferred customers requires manager approval.\n\n[9] OfficeHub Discount Policy (similarity: 0.397)\n    ## Regular Customers\n\n\nRegular customers may receive a discount of up to 10% on a standard order without manager approval.\n\n[10] OfficeHub Discount Policy (similarity: 0.368)\n    ## Preferred Customers\n\n\nPreferred customers may receive a discount of up to 15% without manager approval.\n"
+              },
+              {
+                "args": {
+                  "query": "Ahmed Industries"
+                },
+                "tool": "search_customer",
+                "result": "Found 1 customer(s):\n  - ID: b6dd4a42-f273-4f87-a05a-9280c920a4e9 | Name: Ahmed Industries | Email: purchasing@ahmed-ind.com | Company: Ahmed Industries LLC"
+              },
+              {
+                "args": {
+                  "customer_id": "b6dd4a42-f273-4f87-a05a-9280c920a4e9"
+                },
+                "tool": "get_customer_details",
+                "result": "Customer: Ahmed Industries\n  ID: b6dd4a42-f273-4f87-a05a-9280c920a4e9\n  Email: purchasing@ahmed-ind.com\n  Phone: +1-555-0199\n  Company: Ahmed Industries LLC\n  Address: N/A\n  Notes: Preferred customer tier - approved for up to 15% discount.\n  Created: 2026-03-24"
+              }
+            ],
+            "proposal": {
+              "total": "4249.83",
+              "quote_id": "86de2158-63b3-4cd6-8f4b-35e6c6c7778f",
+              "subtotal": "4999.80",
+              "previous_status": "approved",
+              "discount_percent": "16.0"
+            },
+            "thread_id": "73388e95-11fc-4889-962f-925c40bb6f51",
+            "request_id": "53cebf84-a6b9-48d2-9c41-d38d4c3b9107"
+          },
+          "reason": "Discount of 16.0% exceeds the approval threshold of 15%.",
+          "status": "pending",
+          "requested_by": "agent",
+          "approved_by": null,
+          "resolved_at": null,
+          "created_at": "2026-10-07T05:26:54.832482Z"
+        }
+      ]
+    },
+    {
+      "step": "4 / supplement \u2014 manager approval",
+      "method": "POST",
+      "path": "/api/v1/approvals/e824f905-c177-5eb2-b001-a5e3760215bd/approve",
+      "request": {
+        "comment": "Manual verification of conversational quote creation and discount approval."
+      },
+      "status_code": 200,
+      "response": {
+        "response": "\u2705 **Manager Approval Granted**\n\nThe manager decision was recorded.\n\n[search_business_policy]: Policy search results for: 'maximum discount percentage OfficeHub policy'\n\n[1] OfficeHub Discount Policy (similarity: 0.769)\n    # OfficeHub Discount Policy\n\n[2] OfficeHub Payment Policy (similarity: 0.603)\n    # OfficeHub Payment Policy\n\n[3] OfficeHub Shipping Policy (similarity: 0.570)\n    # OfficeHub Shipping Policy\n\n[4] OfficeHub Return Policy (similarity: 0.559)\n    # OfficeHub Return Policy\n\n[5] OfficeHub Approval Policy (similarity: 0.533)\n    # OfficeHub Approval Policy\n\n[search_business_policy]: Policy search results for: 'OfficeHub Discount Policy maximum discount'\n\n[1] OfficeHub Discount Policy (similarity: 0.782)\n    # OfficeHub Discount Policy\n\n[2] OfficeHub Payment Policy (similarity: 0.601)\n    # OfficeHub Payment Policy\n\n[3] OfficeHub Shipping Policy (similarity: 0.569)\n    # OfficeHub Shipping Policy\n\n[4] OfficeHub Return Policy (similarity: 0.556)\n    # OfficeHub Return Policy\n\n[5] OfficeHub Approval Policy (similarity: 0.525)\n    # OfficeHub Approval Policy\n\n[6] OfficeHub Discount Policy (similarity: 0.502)\n    ## Discounts Above the Limit\n\n\nAny discount above the customer's normal limit requires manager approval before the quotation is sent to the customer.\n\n[7] OfficeHub Discount Policy (similarity: 0.455)\n    ## Maximum Discount\n\n\nNo customer may receive a discount greater than 25%.\n\n[8] OfficeHub Approval Policy (similarity: 0.454)\n    ## Discount Approvals\n\n\nAny discount above 10% for regular customers or 15% for preferred customers requires manager approval.\n\n[9] OfficeHub Discount Policy (similarity: 0.397)\n    ## Regular Customers\n\n\nRegular customers may receive a discount of up to 10% on a standard order without manager approval.\n\n[10] OfficeHub Discount Policy (similarity: 0.368)\n    ## Preferred Customers\n\n\nPreferred customers may receive a discount of up to 15% without manager approval.\n\n[search_customer]: Found 1 customer(s):\n  - ID: b6dd4a42-f273-4f87-a05a-9280c920a4e9 | Name: Ahmed Industries | Email: purchasing@ahmed-ind.com | Company: Ahmed Industries LLC\n[get_customer_details]: Customer: Ahmed Industries\n  ID: b6dd4a42-f273-4f87-a05a-9280c920a4e9\n  Email: purchasing@ahmed-ind.com\n  Phone: +1-555-0199\n  Company: Ahmed Industries LLC\n  Address: N/A\n  Notes: Preferred customer tier - approved for up to 15% discount.\n  Created: 2026-03-24\n[manager_approval]: Discount applied to Q-86DE215863B34CD68F4B35E6C6C7778F. Total: $4199.83. No order was created.",
+        "workflow": "create_quote",
+        "intent": "create_quote",
+        "entities": {
+          "discount_percent": 16,
+          "quote_id": "86de2158-63b3-4cd6-8f4b-35e6c6c7778f"
+        },
+        "approval_required": true,
+        "approval_id": "e824f905-c177-5eb2-b001-a5e3760215bd",
+        "approval_decision": "approved",
+        "thread_id": "73388e95-11fc-4889-962f-925c40bb6f51",
+        "request_id": "53cebf84-a6b9-48d2-9c41-d38d4c3b9107",
+        "error": null
+      }
+    }
+  ],
+  "automatic_discount_threshold": "15",
+  "created_quote": {
+    "id": "86de2158-63b3-4cd6-8f4b-35e6c6c7778f",
+    "quote_number": "Q-86DE215863B34CD68F4B35E6C6C7778F",
+    "status": "draft",
+    "subtotal": "4999.80",
+    "discount_percent": "0.00",
+    "total": "4999.80",
+    "approval_id": null
+  },
+  "quote_after_15_percent": {
+    "id": "86de2158-63b3-4cd6-8f4b-35e6c6c7778f",
+    "quote_number": "Q-86DE215863B34CD68F4B35E6C6C7778F",
+    "status": "approved",
+    "subtotal": "4999.80",
+    "discount_percent": "15.00",
+    "total": "4249.83",
+    "approval_id": null
+  },
+  "quote_before_approval": {
+    "id": "86de2158-63b3-4cd6-8f4b-35e6c6c7778f",
+    "quote_number": "Q-86DE215863B34CD68F4B35E6C6C7778F",
+    "status": "pending_approval",
+    "subtotal": "4999.80",
+    "discount_percent": "15.00",
+    "total": "4249.83",
+    "approval_id": "e824f905-c177-5eb2-b001-a5e3760215bd"
+  },
+  "quote_after_approval": {
+    "id": "86de2158-63b3-4cd6-8f4b-35e6c6c7778f",
+    "quote_number": "Q-86DE215863B34CD68F4B35E6C6C7778F",
+    "status": "approved",
+    "subtotal": "4999.80",
+    "discount_percent": "16.00",
+    "total": "4199.83",
+    "approval_id": "e824f905-c177-5eb2-b001-a5e3760215bd"
+  }
+}

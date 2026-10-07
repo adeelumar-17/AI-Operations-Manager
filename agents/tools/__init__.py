@@ -21,6 +21,7 @@ from agents.tools.inventory_tools import (
     get_all_products,
 )
 from agents.tools.quote_tools import (
+    create_quote,
     get_quote,
     apply_discount_to_quote,
     convert_quote_to_order,
@@ -55,6 +56,7 @@ ALL_TOOLS = [
     update_inventory,
     get_all_products,
     # Quotes
+    create_quote,
     get_quote,
     apply_discount_to_quote,
     convert_quote_to_order,

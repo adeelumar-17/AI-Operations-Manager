@@ -6,6 +6,7 @@ Classes:
     None (LangChain tool definition module)
 
 Methods:
+    create_quote: Tool to create a new draft from customer/product identifiers and catalog prices.
     _make_quote_service: Helper factory creating a QuoteService instance with a fresh DB session.
     get_quote: Tool to retrieve a quote and its constituent line items by quote ID.
     apply_discount_to_quote: Tool to apply a percentage discount to an existing quote, returning discount details.
@@ -13,8 +14,11 @@ Methods:
 '''
 
 import logging
+import json
 from decimal import Decimal
 from typing import Annotated
+from uuid import UUID
+from pydantic import BaseModel, Field, StrictInt
 
 
 from langchain_core.tools import tool
@@ -22,11 +26,19 @@ from langchain_core.tools import tool
 from backend.app.db.database import SessionLocal
 from backend.app.db.repositories.order_repository import OrderRepository
 from backend.app.db.repositories.quote_repository import QuoteRepository
+from backend.app.db.repositories.product_repository import ProductRepository
 from backend.app.services.quote_service import QuoteService
 from backend.app.services.authorization_service import discount_limit, check_discount_authorization
 from backend.app.services.exceptions import ApprovalRequired, ValidationError
+from agents.tools.customer_tools import _make_customer_service
+from agents.tools.inventory_tools import _find_product
 
 logger = logging.getLogger(__name__)
+
+
+class QuoteCreationItem(BaseModel):
+    product_identifier: str = Field(..., description="Product UUID, exact SKU, or product name")
+    quantity: StrictInt = Field(..., gt=0, description="Positive whole number of units")
 
 
 def _make_quote_service() -> tuple[QuoteService, object]:
@@ -36,6 +48,62 @@ def _make_quote_service() -> tuple[QuoteService, object]:
         order_repository=OrderRepository(session),
     )
     return service, session
+
+
+@tool
+def create_quote(
+    customer_identifier: Annotated[str, "Customer name, email, company name, or UUID"],
+    items: Annotated[list[QuoteCreationItem], "Items with product_identifier and positive integer quantity; prices come from the database"],
+) -> str:
+    """Create a new draft quote using stored catalog prices and service calculations.
+
+    Resolve ambiguous customers/products by asking for a UUID/SKU; never guess.
+    Returns JSON with quote_id, quote_number, customer_id, exact totals and items.
+    Creation neither applies discounts nor deducts stock. Use the returned ID in
+    subsequent discount, approval or explicit order-conversion requests.
+    """
+    customers, session = _make_customer_service()
+    try:
+        identifier = customer_identifier.strip()
+        try:
+            customer_id = UUID(identifier)
+        except ValueError:
+            matches = customers.search_customers(identifier)
+            if len(matches) != 1:
+                if not matches:
+                    raise ValidationError(f"Customer '{identifier}' not found.")
+                raise ValidationError("Ambiguous customer. Specify a customer UUID: " +
+                                      ", ".join(f"{c.name} ({c.id})" for c in matches))
+            customer = matches[0]
+        else:
+            customer = customers.get_customer(customer_id)
+        products = ProductRepository(session)
+        resolved = []
+        for item in items:
+            product = _find_product(products, item.product_identifier)
+            if product is None:
+                raise ValidationError(f"Product '{item.product_identifier}' not found.")
+            resolved.append((product, item.quantity))
+        service = QuoteService(QuoteRepository(session), customers.order_repository)
+        quote = service.create_quote(customer.id, [
+            (product.id, quantity, product.unit_price) for product, quantity in resolved
+        ])
+        session.commit()
+        return json.dumps({
+            "success": True, "quote_id": str(quote.id), "quote_number": quote.quote_number,
+            "customer_id": str(customer.id), "customer_name": customer.name, "status": quote.status,
+            "subtotal": str(quote.subtotal), "discount_percent": str(quote.discount_percent),
+            "discount_amount": str(quote.discount_amount), "total": str(quote.total),
+            "items": [{"product_id": str(product.id), "sku": product.sku,
+                       "product_name": product.name, "quantity": quantity,
+                       "unit_price": str(product.unit_price)} for product, quantity in resolved],
+        })
+    except Exception as exc:
+        session.rollback()
+        logger.exception("Quote creation failed")
+        return f"Error creating quote: {exc}"
+    finally:
+        session.close()
 
 
 @tool
@@ -76,7 +144,7 @@ def get_quote(
 @tool
 def apply_discount_to_quote(
     quote_id: Annotated[str, "UUID of the quote"],
-    discount_percent: Annotated[float, "Discount percentage (0-100) to apply"],
+    discount_percent: Annotated[float, "Discount percentage (0-25) to apply under OfficeHub policy"],
 ) -> str:
     """Apply a discount percentage to a quote.
 

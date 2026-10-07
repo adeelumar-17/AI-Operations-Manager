@@ -4,6 +4,7 @@ Classes:
     - QuoteLineItem: Represents an individual line item in a quote, with attributes for quantity and unit price, and a method to calculate the line total.
     - QuoteService: Provides methods for managing quotes and line items, including adding, updating, removing, and calculating quote totals and discounts.
 Methods:
+    - create_quote: Creates a draft using validated catalog-priced items and existing total calculations.
     - calculate_subtotal: Calculates the subtotal of a list of QuoteLineItem instances.
     - calculate_discount_amount: Calculates the discount amount based on a subtotal and a discount percentage.
     - calculate_quote_total: Calculates the final quote total after applying a discount.
@@ -18,7 +19,7 @@ Methods:
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from backend.app.db.models.order import Order
 from backend.app.db.models.quote import Quote
@@ -92,6 +93,33 @@ class QuoteService:
     ):
         self.quote_repository = quote_repository
         self.order_repository = order_repository
+
+    def create_quote(
+        self,
+        customer_id: UUID,
+        items: list[tuple[UUID, int, Decimal]],
+    ) -> Quote:
+        """Create an undiscounted draft from resolved products and catalog prices.
+
+        The caller owns the transaction. Validate every line before saving so an
+        invalid later item cannot leave a partially created quotation.
+        """
+        if not items:
+            raise ValidationError("A quote requires at least one item.")
+        validated = [(product_id, QuoteLineItem(quantity, unit_price))
+                     for product_id, quantity, unit_price in items]
+        quote_id = uuid4()
+        quote = Quote(
+            id=quote_id, quote_number=f"Q-{quote_id.hex.upper()}",
+            customer_id=customer_id, status="draft",
+            subtotal=Decimal("0.00"), discount_percent=Decimal("0.00"),
+            discount_amount=Decimal("0.00"), total=Decimal("0.00"),
+        )
+        quote.items = [QuoteItem(
+            product_id=product_id, quantity=line.quantity,
+            unit_price=line.unit_price, line_total=line.line_total,
+        ) for product_id, line in validated]
+        return self.recalculate_quote(quote)
 
     @staticmethod
     def require_editable(quote):
